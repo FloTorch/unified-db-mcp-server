@@ -1,11 +1,24 @@
 # Unified DB MCP Server
+FROM python:3.11-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    unixodbc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY requirements.txt pyproject.toml ./
+COPY unified_db_mcp/ unified_db_mcp/
+
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt && \
+    pip wheel --no-cache-dir --wheel-dir /wheels .
+
 FROM python:3.11-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     unixodbc \
-    unixodbc-dev \
-    gcc \
-    g++ \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -u 1000 -s /bin/bash appuser
@@ -18,12 +31,8 @@ ENV HOME=/home/appuser \
 
 WORKDIR /app
 
-COPY requirements.txt pyproject.toml ./
-COPY unified_db_mcp/ unified_db_mcp/
-
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir -e .
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 
 RUN chown -R appuser:appuser /app
 USER appuser

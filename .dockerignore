@@ -1,13 +1,51 @@
-venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.env
+# Git and version control
 .git
 .gitignore
+.gitattributes
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+*.egg-info
+.eggs
+*.egg
+.pytest_cache
+.coverage
+.mypy_cache
+.ruff_cache
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+
+# IDE and editor
+.idea
+.vscode
+*.swp
+*.swo
+
+# Demo folder
 demo/
+
+# Database files
 *.db
 *.sqlite
 *.sqlite3
 
+# Test and development
+tests/
+test_*
+*_test.py
+
+# Misc
+*.log
+.DS_Store
+Thumbs.db
+assets/
