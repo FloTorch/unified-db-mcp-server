@@ -1,3 +1,12 @@
+---
+title: Unified DB MCP Server
+emoji: 🗄️
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+---
+
 # Unified DB MCP Server
 
 Unified DB MCP Server is a production-focused MCP service for cross-database schema extraction and schema migration.
