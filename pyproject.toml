@@ -27,8 +27,5 @@ packages = [
     "unified_db_mcp.tools",
     "unified_db_mcp.database_connectors",
     "unified_db_mcp.helpers",
-    "tools",
-    "database_connectors",
-    "helpers",
 ]
 

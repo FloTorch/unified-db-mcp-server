@@ -167,37 +167,6 @@ async def discovery(_request: StarletteRequest) -> JSONResponse:
     )
 
 
-@mcp.custom_route("/check-headers", methods=["GET", "POST"])
-async def check_headers(request: StarletteRequest) -> JSONResponse:
-    """Debug endpoint: returns all x-* headers received so you can verify credential delivery."""
-    x_headers = {k: v for k, v in request.headers.items() if k.lower().startswith("x-")}
-    credential_keys = [
-        "x-source-db-credentials",
-        "x-target-db-credentials",
-        "x-supabase-credentials",
-        "x-mongodb-credentials",
-        "x-db-credentials",
-    ]
-    resolved = {key: request.headers.get(key, "(not present)") for key in credential_keys}
-    logger.info("GET /check-headers - x_headers received: %s", list(x_headers.keys()))
-    return JSONResponse(
-        {
-            "all_x_headers_received": x_headers,
-            "credential_header_check": resolved,
-            "has_source_creds": bool(
-                x_headers.get("x-source-db-credentials")
-                or x_headers.get("x-supabase-credentials")
-                or x_headers.get("x-db-credentials")
-            ),
-            "has_target_creds": bool(
-                x_headers.get("x-target-db-credentials")
-                or x_headers.get("x-mongodb-credentials")
-                or x_headers.get("x-db-credentials")
-            ),
-        }
-    )
-
-
 @mcp.custom_route("/migrate_schema", methods=["POST"])
 async def migrate_schema_simple(request: StarletteRequest) -> JSONResponse:
     """
@@ -339,6 +308,12 @@ def connect_database(
         sqlite_path=sqlite_path,
         ctx=ctx,
     )
+    logger.info(
+        "connect_database: db_type=%s sqlite_path=%s credentials_json=%s",
+        db_type,
+        sqlite_path,
+        credentials_json,
+    )
     return connect_db(
         db_type=db_type,
         sqlite_path=sqlite_path or None,
@@ -360,6 +335,13 @@ def extract_schema(
         credentials_json=credentials_json,
         sqlite_path=sqlite_path,
         ctx=ctx,
+    )
+    logger.info(
+        "extract_schema: db_type=%s tables=%s sqlite_path=%s credentials_json=%s",
+        db_type,
+        tables,
+        sqlite_path,
+        credentials_json,
     )
     return extract_schema_tool(
         db_type=db_type,
@@ -383,6 +365,13 @@ def apply_schema(
         credentials_json=credentials_json,
         sqlite_path=sqlite_path,
         ctx=ctx,
+    )
+    logger.info(
+        "apply_schema: target_db=%s schema_json=%s sqlite_path=%s credentials_json=%s",
+        target_db,
+        schema_json,
+        sqlite_path,
+        credentials_json,
     )
     return apply_schema_tool(
         target_db=target_db,
@@ -422,6 +411,14 @@ def migrate_schema(
         source_sqlite_path=source_sqlite_path,
         target_sqlite_path=target_sqlite_path,
         ctx=ctx,
+    )
+    logger.info(
+        "migrate_schema: source_db=%s target_db=%s tables=%s dry_run=%s require_confirmation=%s source_credentials_json=%s target_credentials_json=%s source_sqlite_path=%s target_sqlite_path=%s",
+        source_db,
+        target_db,
+        tables,
+        dry_run,
+        require_confirmation,
     )
 
     return migrate_schema_text(
