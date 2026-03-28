@@ -9,6 +9,7 @@ import logging
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse
 
@@ -88,6 +89,11 @@ def _normalize_credentials_value(value: str) -> str:
     return candidate
 
 
+def _has_non_empty_header(headers: dict, *keys: str) -> bool:
+    """True when any given header key exists with a non-empty value."""
+    return any(bool(headers.get(key, "")) for key in keys)
+
+
 def _resolve_credentials_from_headers(
     db_type: str,
     credentials_json: str = "",
@@ -95,26 +101,31 @@ def _resolve_credentials_from_headers(
     ctx: Context = None,
 ) -> tuple[str, str]:
     """
-    Resolve credentials/sqlite_path from function args or HTTP headers.
+    Resolve credentials/sqlite_path for MCP tools from HTTP headers only.
 
     Priority:
-    1) explicit function args
-    2) database-specific header: x-<db>-credentials
-    3) global header: x-db-credentials
+    1) database-specific header: x-<db>-credentials
+    2) global header: x-db-credentials
+    3) sqlite path header: x-sqlite-path (sqlite only)
     """
     headers = _extract_headers_from_context(ctx)
     normalized_db = db_type.lower().strip()
 
-    resolved_credentials = credentials_json or ""
-    resolved_sqlite_path = sqlite_path or ""
-
-    if not resolved_credentials:
-        db_header = f"x-{normalized_db}-credentials"
-        resolved_credentials = headers.get(db_header, "") or headers.get("x-db-credentials", "")
+    # Header-only mode for /unified-db/mcp tool calls.
+    db_header = f"x-{normalized_db}-credentials"
+    resolved_credentials = headers.get(db_header, "") or headers.get("x-db-credentials", "")
+    resolved_sqlite_path = ""
     resolved_credentials = _normalize_credentials_value(resolved_credentials)
 
     if not resolved_sqlite_path and normalized_db == "sqlite":
         resolved_sqlite_path = headers.get("x-sqlite-path", "")
+
+    logger.info(
+        "mcp header resolution: operation=single db_type=%s credentials_from_headers=%s sqlite_path_from_headers=%s",
+        normalized_db,
+        bool(resolved_credentials),
+        bool(resolved_sqlite_path),
+    )
 
     return resolved_credentials, resolved_sqlite_path
 
@@ -132,20 +143,31 @@ def _resolve_migration_credentials_from_headers(
     source_key = source_db.lower().strip()
     target_key = target_db.lower().strip()
 
-    src_creds = source_credentials_json or headers.get("x-source-db-credentials", "")
-    tgt_creds = target_credentials_json or headers.get("x-target-db-credentials", "")
+    # Header-only mode for /unified-db/mcp tool calls.
+    src_creds = headers.get("x-source-db-credentials", "")
+    tgt_creds = headers.get("x-target-db-credentials", "")
 
     if not src_creds:
         src_creds = headers.get(f"x-{source_key}-credentials", "") or headers.get("x-db-credentials", "")
     if not tgt_creds:
         tgt_creds = headers.get(f"x-{target_key}-credentials", "") or headers.get("x-db-credentials", "")
 
-    src_sqlite = source_sqlite_path or headers.get("x-source-sqlite-path", "")
-    tgt_sqlite = target_sqlite_path or headers.get("x-target-sqlite-path", "")
+    src_sqlite = headers.get("x-source-sqlite-path", "")
+    tgt_sqlite = headers.get("x-target-sqlite-path", "")
     if not src_sqlite and source_key == "sqlite":
         src_sqlite = headers.get("x-sqlite-path", "")
     if not tgt_sqlite and target_key == "sqlite":
         tgt_sqlite = headers.get("x-sqlite-path", "")
+
+    logger.info(
+        "mcp header resolution: operation=migrate source_db=%s target_db=%s source_credentials_from_headers=%s target_credentials_from_headers=%s source_sqlite_path_from_headers=%s target_sqlite_path_from_headers=%s",
+        source_key,
+        target_key,
+        bool(src_creds),
+        bool(tgt_creds),
+        bool(src_sqlite),
+        bool(tgt_sqlite),
+    )
 
     return (
         _normalize_credentials_value(src_creds),
@@ -219,13 +241,28 @@ async def migrate_schema_simple(request: StarletteRequest) -> JSONResponse:
         )
         source_credentials_json = _normalize_credentials_value(source_credentials_json)
         target_credentials_json = _normalize_credentials_value(target_credentials_json)
+        source_creds_from_headers = _has_non_empty_header(
+            headers,
+            "x-source-db-credentials",
+            f"x-{str(source_db).lower()}-credentials",
+            "x-db-credentials",
+        )
+        target_creds_from_headers = _has_non_empty_header(
+            headers,
+            "x-target-db-credentials",
+            f"x-{str(target_db).lower()}-credentials",
+            "x-db-credentials",
+        )
         logger.info(
             "migrate_schema: source_db=%s target_db=%s dry_run=%s tables=%s "
+            "source_credentials_from_headers=%s target_credentials_from_headers=%s "
             "has_source_creds=%s has_target_creds=%s",
             source_db,
             target_db,
             dry_run,
             tables,
+            source_creds_from_headers,
+            target_creds_from_headers,
             bool(source_credentials_json),
             bool(target_credentials_json),
         )
@@ -309,10 +346,10 @@ def connect_database(
         ctx=ctx,
     )
     logger.info(
-        "connect_database: db_type=%s sqlite_path=%s credentials_json=%s",
+        "connect_database: db_type=%s credentials_from_headers=%s sqlite_path_from_headers=%s",
         db_type,
-        sqlite_path,
-        credentials_json,
+        bool(credentials_json),
+        bool(sqlite_path),
     )
     return connect_db(
         db_type=db_type,
@@ -337,11 +374,11 @@ def extract_schema(
         ctx=ctx,
     )
     logger.info(
-        "extract_schema: db_type=%s tables=%s sqlite_path=%s credentials_json=%s",
+        "extract_schema: db_type=%s tables=%s credentials_from_headers=%s sqlite_path_from_headers=%s",
         db_type,
         tables,
-        sqlite_path,
-        credentials_json,
+        bool(credentials_json),
+        bool(sqlite_path),
     )
     return extract_schema_tool(
         db_type=db_type,
@@ -367,11 +404,10 @@ def apply_schema(
         ctx=ctx,
     )
     logger.info(
-        "apply_schema: target_db=%s schema_json=%s sqlite_path=%s credentials_json=%s",
+        "apply_schema: target_db=%s credentials_from_headers=%s sqlite_path_from_headers=%s",
         target_db,
-        schema_json,
-        sqlite_path,
-        credentials_json,
+        bool(credentials_json),
+        bool(sqlite_path),
     )
     return apply_schema_tool(
         target_db=target_db,
@@ -413,12 +449,16 @@ def migrate_schema(
         ctx=ctx,
     )
     logger.info(
-        "migrate_schema: source_db=%s target_db=%s tables=%s dry_run=%s require_confirmation=%s source_credentials_json=%s target_credentials_json=%s source_sqlite_path=%s target_sqlite_path=%s",
+        "migrate_schema: source_db=%s target_db=%s tables=%s dry_run=%s require_confirmation=%s source_credentials_from_headers=%s target_credentials_from_headers=%s source_sqlite_path_from_headers=%s target_sqlite_path_from_headers=%s",
         source_db,
         target_db,
         tables,
         dry_run,
         require_confirmation,
+        bool(source_credentials_json),
+        bool(target_credentials_json),
+        bool(source_sqlite_path),
+        bool(target_sqlite_path),
     )
 
     return migrate_schema_text(
