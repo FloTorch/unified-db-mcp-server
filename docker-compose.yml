@@ -7,14 +7,14 @@ services:
     container_name: unified-db-mcp-server
     restart: unless-stopped
     ports:
-      - "7861:7861"
+      - "7860:7860"
     environment:
-      - PORT=7861
+      - PORT=7860
       - HOST=0.0.0.0
     env_file:
       - .env
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7861/unified-db/mcp')"]
+      test: ["CMD", "python", "-c", "import urllib.request; req=urllib.request.Request('http://127.0.0.1:7860/unified-db/mcp', headers={'Accept':'text/event-stream'}); urllib.request.urlopen(req, timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3

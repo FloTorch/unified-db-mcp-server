@@ -4,14 +4,14 @@ emoji: 🗄️
 colorFrom: blue
 colorTo: indigo
 sdk: docker
-app_port: 7861
+app_port: 7860
 pinned: false
 ---
 
 # Unified DB MCP Server
 
 Unified DB MCP Server is a production-focused MCP service for cross-database schema extraction and schema migration.
-It exposes MCP tools over streamable HTTP and also provides a simple REST route for direct API clients.
+It exposes MCP tools over a single streamable HTTP endpoint.
 
 ## What This Project Does
 
@@ -36,7 +36,6 @@ It exposes MCP tools over streamable HTTP and also provides a simple REST route 
 
 - MCP tool interface for client integrations (Cursor, MCP-compatible agents, custom clients).
 - Streamable HTTP MCP endpoint: `/unified-db/mcp`.
-- REST migration endpoint: `POST /migrate_schema`.
 - Header-based credentials support for API calls.
 - Dockerized runtime with container healthcheck.
 
@@ -72,7 +71,7 @@ unified-db-mcp-server/
 Core server environment variables:
 
 - `HOST` (default: `0.0.0.0`)
-- `PORT` (default: `7861`)
+- `PORT` (default: `7860`)
 
 Credential/environment defaults are defined in `unified_db_mcp/schema_migrate.py`.
 At runtime, request-level credentials can override defaults via tool arguments or request headers.
@@ -81,21 +80,8 @@ At runtime, request-level credentials can override defaults via tool arguments o
 
 - `GET /unified-db/mcp`
   - MCP discovery and streamable transport endpoint.
+  - This is the only exposed application endpoint.
   - Requires appropriate `Accept` header for streamable behavior.
-- `POST /migrate_schema`
-  - Simple JSON route for non-MCP clients.
-
-Example request:
-
-```json
-{
-  "source_db": "sqlite",
-  "target_db": "mysql",
-  "tables": "users,orders",
-  "dry_run": true,
-  "require_confirmation": false
-}
-```
 
 ## Production Deployment (Docker)
 
@@ -110,9 +96,9 @@ docker build -t unified-db-mcp .
 ```bash
 docker run --rm -d \
   --name unified-db-mcp \
-  -p 7861:7861 \
+  -p 7860:7860 \
   -e HOST=0.0.0.0 \
-  -e PORT=7861 \
+  -e PORT=7860 \
   unified-db-mcp
 ```
 
@@ -146,7 +132,7 @@ A plain request may return `406 Not Acceptable` if the streamable header is miss
 Use:
 
 ```bash
-curl -i -H "Accept: text/event-stream" http://localhost:7861/unified-db/mcp
+curl -i -H "Accept: text/event-stream" http://localhost:7860/unified-db/mcp
 ```
 
 Expected response includes:
@@ -160,4 +146,3 @@ Expected response includes:
 - Keep credentials in environment variables or secure secret stores.
 - Avoid embedding credentials in source files or committed artifacts.
 - Use container logs first when diagnosing migration or connectivity failures.
-

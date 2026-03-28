@@ -13,11 +13,7 @@ from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse
 
 from unified_db_mcp.config import APP_NAME, HOST, MCP_PATH, PORT, SUPPORTED_DATABASES
-from unified_db_mcp.tools.migrate_schema_tool import (
-    migrate_schema_details,
-    migrate_schema_text,
-    parse_tables_arg,
-)
+from unified_db_mcp.tools.migrate_schema_tool import migrate_schema_text
 from unified_db_mcp.tools.schema_connector_tools import apply_schema_tool, connect_db, extract_schema_tool
 
 logging.basicConfig(
@@ -39,18 +35,112 @@ mcp = FastMCP(
 )
 
 
+_SENSITIVE_HEADER_MARKERS = (
+    "authorization",
+    "credentials",
+    "api-key",
+    "api_key",
+    "token",
+    "password",
+    "secret",
+    "cookie",
+)
+
+
+def _is_sensitive_header(header_name: str) -> bool:
+    name = (header_name or "").lower()
+    return any(marker in name for marker in _SENSITIVE_HEADER_MARKERS)
+
+
+def _sanitize_header_value(header_name: str, header_value: str) -> str:
+    value = str(header_value or "")
+    if _is_sensitive_header(header_name):
+        return f"<redacted len={len(value)}>"
+    if len(value) > 120:
+        return f"{value[:120]}...<truncated len={len(value)}>"
+    return value
+
+
+def _log_headers_snapshot(operation: str, headers: dict) -> None:
+    if not headers:
+        logger.warning("mcp headers: operation=%s no_headers_found=true", operation)
+        return
+    sanitized = {k: _sanitize_header_value(k, v) for k, v in sorted(headers.items())}
+    logger.info(
+        "mcp headers: operation=%s count=%s names=%s values=%s",
+        operation,
+        len(headers),
+        sorted(headers.keys()),
+        sanitized,
+    )
+
+
 def _extract_headers_from_context(ctx: Context = None) -> dict:
     """Extract request headers from FastMCP context as lowercase keys."""
     if not ctx:
+        logger.warning("mcp header extraction: ctx_missing=true")
         return {}
     try:
         request_context = ctx.request_context
         if hasattr(request_context, "request") and request_context.request:
             request = request_context.request
-            return {name.lower(): request.headers[name] for name in request.headers.keys()}
-    except Exception:
+            headers = {name.lower(): request.headers[name] for name in request.headers.keys()}
+            logger.info(
+                "mcp header extraction: source=request_context.request.headers extracted=%s",
+                bool(headers),
+            )
+            return headers
+        if hasattr(request_context, "headers") and request_context.headers:
+            raw_headers = request_context.headers
+            headers = {str(name).lower(): str(value) for name, value in raw_headers.items()}
+            logger.info(
+                "mcp header extraction: source=request_context.headers extracted=%s",
+                bool(headers),
+            )
+            return headers
+        logger.warning(
+            "mcp header extraction: source=none request_context_type=%s attrs=%s",
+            type(request_context).__name__,
+            [a for a in dir(request_context) if not a.startswith("_")][:20],
+        )
+    except Exception as exc:
+        logger.exception("mcp header extraction failed: %s", exc)
         return {}
     return {}
+
+
+def _header_value(headers: dict, *names: str) -> str:
+    """
+    Return first non-empty header value from accepted aliases.
+
+    Also supports underscore variants for clients that normalize names.
+    """
+    for name in names:
+        key = name.lower().strip()
+        value = headers.get(key, "")
+        if value:
+            return str(value).strip()
+        alt_key = key.replace("-", "_")
+        value = headers.get(alt_key, "")
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _header_value_with_source(headers: dict, *names: str) -> tuple[str, str]:
+    """
+    Return (matched_header_name, matched_value) for first non-empty header alias.
+    """
+    for name in names:
+        key = name.lower().strip()
+        value = headers.get(key, "")
+        if value:
+            return key, str(value).strip()
+        alt_key = key.replace("-", "_")
+        value = headers.get(alt_key, "")
+        if value:
+            return alt_key, str(value).strip()
+    return "", ""
 
 
 def _normalize_credentials_value(value: str) -> str:
@@ -67,30 +157,57 @@ def _normalize_credentials_value(value: str) -> str:
     if not candidate:
         return ""
 
+    # Tolerate UI-entered separator punctuation around JSON payloads.
+    # Example accepted input:
+    #   , { "api_key": "...", "db_password": "...", "project_name": "..." }
+    candidate = candidate.strip(" \t\r\n,;")
+    if not candidate:
+        return ""
+
+    # Unwrap a single layer of quotes if the JSON was pasted as a quoted string.
+    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in ('"', "'"):
+        candidate = candidate[1:-1].strip()
+        candidate = candidate.strip(" \t\r\n,;")
+        if not candidate:
+            return ""
+
     # If already valid JSON object text, use it directly.
     try:
         parsed = json.loads(candidate)
         if isinstance(parsed, dict):
             return json.dumps(parsed)
+        # Also accept JSON strings that contain JSON object text.
+        if isinstance(parsed, str):
+            nested = parsed.strip().strip(" \t\r\n,;")
+            try:
+                nested_obj = json.loads(nested)
+                if isinstance(nested_obj, dict):
+                    return json.dumps(nested_obj)
+            except Exception:
+                pass
     except Exception:
         pass
 
     # Try base64 decode then parse as JSON object.
     try:
-        decoded = base64.b64decode(candidate).decode("utf-8")
+        decoded = base64.b64decode(candidate, validate=False).decode("utf-8")
+        decoded = decoded.strip().strip(" \t\r\n,;")
         parsed = json.loads(decoded)
         if isinstance(parsed, dict):
             return json.dumps(parsed)
+        if isinstance(parsed, str):
+            nested = parsed.strip().strip(" \t\r\n,;")
+            try:
+                nested_obj = json.loads(nested)
+                if isinstance(nested_obj, dict):
+                    return json.dumps(nested_obj)
+            except Exception:
+                pass
     except Exception:
         pass
 
     # Fallback to raw value; downstream validation will raise clear errors.
     return candidate
-
-
-def _has_non_empty_header(headers: dict, *keys: str) -> bool:
-    """True when any given header key exists with a non-empty value."""
-    return any(bool(headers.get(key, "")) for key in keys)
 
 
 def _resolve_credentials_from_headers(
@@ -102,28 +219,36 @@ def _resolve_credentials_from_headers(
     """
     Resolve credentials/sqlite_path for MCP tools from HTTP headers only.
 
-    Priority:
-    1) database-specific header: x-<db>-credentials
-    2) global header: x-db-credentials
-    3) sqlite path header: x-sqlite-path (sqlite only)
+    Universal header mode:
+    - credentials: x-db-credentials
+    - sqlite path: x-sqlite-path (sqlite only)
     """
     headers = _extract_headers_from_context(ctx)
+    _log_headers_snapshot("single", headers)
     normalized_db = db_type.lower().strip()
 
-    # Header-only mode for /unified-db/mcp tool calls.
-    db_header = f"x-{normalized_db}-credentials"
-    resolved_credentials = headers.get(db_header, "") or headers.get("x-db-credentials", "")
-    resolved_sqlite_path = ""
-    resolved_credentials = _normalize_credentials_value(resolved_credentials)
+    # Universal header-only mode for /unified-db/mcp tool calls.
+    matched_cred_header, raw_header_credentials = _header_value_with_source(
+        headers,
+        "x-db-credentials",
+    )
+    header_credentials = raw_header_credentials
+    header_sqlite_path = ""
+    header_credentials = _normalize_credentials_value(header_credentials)
 
-    if not resolved_sqlite_path and normalized_db == "sqlite":
-        resolved_sqlite_path = headers.get("x-sqlite-path", "")
+    if not header_sqlite_path and normalized_db == "sqlite":
+        header_sqlite_path = _header_value(headers, "x-sqlite-path", "x-source-sqlite-path", "x-target-sqlite-path")
+
+    resolved_credentials = header_credentials
+    resolved_sqlite_path = (header_sqlite_path or "").strip()
 
     logger.info(
-        "mcp header resolution: operation=single db_type=%s credentials_from_headers=%s sqlite_path_from_headers=%s",
+        "mcp credential resolution: operation=single db_type=%s expected_headers=%s matched_credential_header=%s credentials_from_headers=%s sqlite_path_from_headers=%s",
         normalized_db,
-        bool(resolved_credentials),
-        bool(resolved_sqlite_path),
+        ["x-db-credentials"],
+        matched_cred_header or "none",
+        bool(header_credentials),
+        bool(header_sqlite_path),
     )
 
     return resolved_credentials, resolved_sqlite_path
@@ -139,41 +264,48 @@ def _resolve_migration_credentials_from_headers(
     ctx: Context = None,
 ) -> tuple[str, str, str, str]:
     headers = _extract_headers_from_context(ctx)
+    _log_headers_snapshot("migrate", headers)
     source_key = source_db.lower().strip()
     target_key = target_db.lower().strip()
 
     # Header-only mode for /unified-db/mcp tool calls.
-    src_creds = headers.get("x-source-db-credentials", "")
-    tgt_creds = headers.get("x-target-db-credentials", "")
+    src_creds_header_name, src_creds_header_raw = _header_value_with_source(headers, "x-source-db-credentials")
+    tgt_creds_header_name, tgt_creds_header_raw = _header_value_with_source(headers, "x-target-db-credentials")
+    src_creds_header = src_creds_header_raw
+    tgt_creds_header = tgt_creds_header_raw
 
-    if not src_creds:
-        src_creds = headers.get(f"x-{source_key}-credentials", "") or headers.get("x-db-credentials", "")
-    if not tgt_creds:
-        tgt_creds = headers.get(f"x-{target_key}-credentials", "") or headers.get("x-db-credentials", "")
+    if not src_creds_header:
+        src_creds_header_name, src_creds_header = _header_value_with_source(headers, "x-db-credentials")
+    if not tgt_creds_header:
+        tgt_creds_header_name, tgt_creds_header = _header_value_with_source(headers, "x-db-credentials")
 
-    src_sqlite = headers.get("x-source-sqlite-path", "")
-    tgt_sqlite = headers.get("x-target-sqlite-path", "")
-    if not src_sqlite and source_key == "sqlite":
-        src_sqlite = headers.get("x-sqlite-path", "")
-    if not tgt_sqlite and target_key == "sqlite":
-        tgt_sqlite = headers.get("x-sqlite-path", "")
+    src_sqlite_header = _header_value(headers, "x-source-sqlite-path")
+    tgt_sqlite_header = _header_value(headers, "x-target-sqlite-path")
+    if not src_sqlite_header and source_key == "sqlite":
+        src_sqlite_header = _header_value(headers, "x-sqlite-path")
+    if not tgt_sqlite_header and target_key == "sqlite":
+        tgt_sqlite_header = _header_value(headers, "x-sqlite-path")
+
+    src_creds = _normalize_credentials_value(src_creds_header)
+    tgt_creds = _normalize_credentials_value(tgt_creds_header)
+    src_sqlite = (src_sqlite_header or "").strip()
+    tgt_sqlite = (tgt_sqlite_header or "").strip()
 
     logger.info(
-        "mcp header resolution: operation=migrate source_db=%s target_db=%s source_credentials_from_headers=%s target_credentials_from_headers=%s source_sqlite_path_from_headers=%s target_sqlite_path_from_headers=%s",
+        "mcp credential resolution: operation=migrate source_db=%s target_db=%s source_credentials_from_headers=%s target_credentials_from_headers=%s source_matched_header=%s target_matched_header=%s source_sqlite_path_from_headers=%s target_sqlite_path_from_headers=%s source_headers_checked=%s target_headers_checked=%s",
         source_key,
         target_key,
-        bool(src_creds),
-        bool(tgt_creds),
-        bool(src_sqlite),
-        bool(tgt_sqlite),
+        bool(src_creds_header),
+        bool(tgt_creds_header),
+        src_creds_header_name or "none",
+        tgt_creds_header_name or "none",
+        bool(src_sqlite_header),
+        bool(tgt_sqlite_header),
+        ["x-source-db-credentials", "x-db-credentials"],
+        ["x-target-db-credentials", "x-db-credentials"],
     )
 
-    return (
-        _normalize_credentials_value(src_creds),
-        _normalize_credentials_value(tgt_creds),
-        src_sqlite,
-        tgt_sqlite,
-    )
+    return (src_creds, tgt_creds, src_sqlite, tgt_sqlite)
 
 
 @mcp.custom_route(MCP_PATH, methods=["GET"])
@@ -186,148 +318,6 @@ async def discovery(_request: StarletteRequest) -> JSONResponse:
             "supported_databases": SUPPORTED_DATABASES,
         }
     )
-
-
-@mcp.custom_route("/migrate_schema", methods=["POST"])
-async def migrate_schema_simple(request: StarletteRequest) -> JSONResponse:
-    """
-    Simple Postman-friendly route:
-    {
-      "source_db": "sqlite",
-      "target_db": "mysql",
-      "tables": "users,orders"   // optional; omit/empty => all tables
-    }
-    """
-    client = request.client.host if request.client else "unknown"
-    logger.info("POST /migrate_schema from %s", client)
-    try:
-        body = await request.json()
-        source_db = body.get("source_db")
-        target_db = body.get("target_db")
-        tables = body.get("tables")
-        dry_run = bool(body.get("dry_run", False))
-        require_confirmation = bool(body.get("require_confirmation", False))
-        source_credentials_json = body.get("source_credentials_json", "")
-        target_credentials_json = body.get("target_credentials_json", "")
-        source_db_credentials = body.get("source_db_credentials")
-        target_db_credentials = body.get("target_db_credentials")
-        source_sqlite_path = body.get("source_sqlite_path", "")
-        target_sqlite_path = body.get("target_sqlite_path", "")
-
-        # Body object credentials are optional fallback when headers are not provided.
-        if source_db_credentials and isinstance(source_db_credentials, dict):
-            source_credentials_json = json.dumps(source_db_credentials)
-        if target_db_credentials and isinstance(target_db_credentials, dict):
-            target_credentials_json = json.dumps(target_db_credentials)
-
-        headers = {name.lower(): value for name, value in request.headers.items()}
-        logger.info(
-            "migrate_schema incoming headers: %s",
-            {k: v for k, v in headers.items() if k.startswith("x-")},
-        )
-        # Header-first resolution (user-provided headers take priority).
-        source_credentials_json = (
-            headers.get("x-source-db-credentials", "")
-            or headers.get(f"x-{str(source_db).lower()}-credentials", "")
-            or headers.get("x-db-credentials", "")
-            or source_credentials_json
-        )
-        target_credentials_json = (
-            headers.get("x-target-db-credentials", "")
-            or headers.get(f"x-{str(target_db).lower()}-credentials", "")
-            or headers.get("x-db-credentials", "")
-            or target_credentials_json
-        )
-        source_credentials_json = _normalize_credentials_value(source_credentials_json)
-        target_credentials_json = _normalize_credentials_value(target_credentials_json)
-        source_creds_from_headers = _has_non_empty_header(
-            headers,
-            "x-source-db-credentials",
-            f"x-{str(source_db).lower()}-credentials",
-            "x-db-credentials",
-        )
-        target_creds_from_headers = _has_non_empty_header(
-            headers,
-            "x-target-db-credentials",
-            f"x-{str(target_db).lower()}-credentials",
-            "x-db-credentials",
-        )
-        logger.info(
-            "migrate_schema: source_db=%s target_db=%s dry_run=%s tables=%s "
-            "source_credentials_from_headers=%s target_credentials_from_headers=%s "
-            "has_source_creds=%s has_target_creds=%s",
-            source_db,
-            target_db,
-            dry_run,
-            tables,
-            source_creds_from_headers,
-            target_creds_from_headers,
-            bool(source_credentials_json),
-            bool(target_credentials_json),
-        )
-        source_sqlite_path = (
-            headers.get("x-source-sqlite-path", "")
-            or (headers.get("x-sqlite-path", "") if str(source_db).lower() == "sqlite" else "")
-            or source_sqlite_path
-        )
-        target_sqlite_path = (
-            headers.get("x-target-sqlite-path", "")
-            or (headers.get("x-sqlite-path", "") if str(target_db).lower() == "sqlite" else "")
-            or target_sqlite_path
-        )
-
-        if str(source_db).lower() != "sqlite" and not source_credentials_json:
-            return JSONResponse(
-                {
-                    "success": False,
-                    "error": "Missing source credentials header. Provide x-source-db-credentials (or x-<source_db>-credentials).",
-                },
-                status_code=400,
-            )
-        if str(target_db).lower() != "sqlite" and not target_credentials_json:
-            return JSONResponse(
-                {
-                    "success": False,
-                    "error": "Missing target credentials header. Provide x-target-db-credentials (or x-<target_db>-credentials).",
-                },
-                status_code=400,
-            )
-
-        result_details = migrate_schema_details(
-            source_db=source_db,
-            target_db=target_db,
-            tables=tables,
-            dry_run=dry_run,
-            require_confirmation=require_confirmation,
-            source_credentials_json=source_credentials_json or None,
-            target_credentials_json=target_credentials_json or None,
-            source_sqlite_path=source_sqlite_path or None,
-            target_sqlite_path=target_sqlite_path or None,
-        )
-
-        ok = bool(result_details.get("success", False))
-        logger.info(
-            "migrate_schema finished: success=%s table_count=%s",
-            ok,
-            result_details.get("table_count", 0),
-        )
-        return JSONResponse(
-            {
-                "success": ok,
-                "result": result_details.get("result", ""),
-                "source_db": source_db,
-                "target_db": target_db,
-                "tables": result_details.get("tables", parse_tables_arg(tables)),
-                "table_count": result_details.get("table_count", 0),
-                "dry_run": dry_run,
-            }
-        )
-    except Exception as exc:
-        logger.exception("Error while handling /migrate_schema")
-        return JSONResponse(
-            {"success": False, "error": str(exc), "error_type": type(exc).__name__},
-            status_code=500,
-        )
 
 
 @mcp.tool()
