@@ -167,23 +167,6 @@ async def discovery(_request: StarletteRequest) -> JSONResponse:
     )
 
 
-@mcp.custom_route("/", methods=["GET"])
-async def root(_request: StarletteRequest) -> JSONResponse:
-    return JSONResponse(
-        {
-            "service": APP_NAME,
-            "status": "ok",
-            "mcp_path": MCP_PATH,
-            "health_path": "/health",
-        }
-    )
-
-
-@mcp.custom_route("/health", methods=["GET"])
-async def health(_request: StarletteRequest) -> JSONResponse:
-    return JSONResponse({"status": "ok"})
-
-
 @mcp.custom_route("/migrate_schema", methods=["POST"])
 async def migrate_schema_simple(request: StarletteRequest) -> JSONResponse:
     """
