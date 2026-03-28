@@ -69,8 +69,8 @@ jobs:
       AWS_REGION: us-east-1
       ASSUME_ROLE: arn:aws:iam::677276078734:role/flotorch-githubactions-automation-role
       EKS_CLUSTER_NAME: FloTorch-Internal-cluster-floint
-      K8S_NAMESPACE: dev
-      K8S_DEPLOYMENT: unified-db-mcp-server
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'dev' }}
+      K8S_DEPLOYMENT: ${{ vars.K8S_DEPLOYMENT || 'unified-db-mcp-server' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -94,7 +94,15 @@ jobs:
         run: |
           kubectl version --client
           kubectl get ns
-          kubectl -n ${{ env.K8S_NAMESPACE }} get deployment ${{ env.K8S_DEPLOYMENT }}
+          kubectl -n ${{ env.K8S_NAMESPACE }} get deployments
+          kubectl -n ${{ env.K8S_NAMESPACE }} get deployment ${{ env.K8S_DEPLOYMENT }} || {
+            echo "Deployment '${{ env.K8S_DEPLOYMENT }}' not found in namespace '${{ env.K8S_NAMESPACE }}'."
+            echo "Available deployments in namespace '${{ env.K8S_NAMESPACE }}':"
+            kubectl -n ${{ env.K8S_NAMESPACE }} get deployments -o name || true
+            echo "All workloads (Deployments/StatefulSets/DaemonSets) across namespaces:"
+            kubectl get deploy,statefulset,daemonset -A -o wide || true
+            exit 1
+          }
 
       - name: Rollout restart deployment
         run: |
