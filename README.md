@@ -4,6 +4,7 @@ emoji: 🗄️
 colorFrom: blue
 colorTo: indigo
 sdk: docker
+app_port: 7861
 pinned: false
 ---
 
@@ -36,6 +37,7 @@ It exposes MCP tools over streamable HTTP and also provides a simple REST route 
 - MCP tool interface for client integrations (Cursor, MCP-compatible agents, custom clients).
 - Streamable HTTP MCP endpoint: `/unified-db/mcp`.
 - REST migration endpoint: `POST /migrate_schema`.
+- Health endpoint for platform probes: `GET /health`.
 - Header-based credentials support for API calls.
 - Dockerized runtime with container healthcheck.
 
@@ -81,6 +83,8 @@ At runtime, request-level credentials can override defaults via tool arguments o
 - `GET /unified-db/mcp`
   - MCP discovery and streamable transport endpoint.
   - Requires appropriate `Accept` header for streamable behavior.
+- `GET /health`
+  - Lightweight liveness probe endpoint that always returns `200`.
 - `POST /migrate_schema`
   - Simple JSON route for non-MCP clients.
 
