@@ -210,6 +210,35 @@ def _normalize_credentials_value(value: str) -> str:
     return candidate
 
 
+def _try_parse_credentials_json(value: str) -> dict:
+    """Best-effort parse normalized credentials JSON into dict."""
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return {}
+    return {}
+
+
+def _credentials_match_db_type(db_type: str, credentials: dict) -> bool:
+    """Heuristic check to pick source/target fallback creds for single-tool calls."""
+    key = (db_type or "").lower().strip()
+    if not credentials:
+        return False
+    keys = {str(k).lower() for k in credentials.keys()}
+
+    if key == "supabase":
+        return ("api_key" in keys) or ("key" in keys) or ("connection_string" in keys)
+    if key in {"mysql", "mariadb", "postgresql", "mongodb", "sqlserver", "cassandra"}:
+        return ("host" in keys) or ("connection_string" in keys) or ("user" in keys) or ("username" in keys)
+    if key == "sqlite":
+        return "database_path" in keys
+    return bool(keys)
+
+
 def _resolve_credentials_from_headers(
     db_type: str,
     credentials_json: str = "",
@@ -228,13 +257,44 @@ def _resolve_credentials_from_headers(
     normalized_db = db_type.lower().strip()
 
     # Universal header-only mode for /unified-db/mcp tool calls.
-    matched_cred_header, raw_header_credentials = _header_value_with_source(
-        headers,
-        "x-db-credentials",
-    )
-    header_credentials = raw_header_credentials
+    matched_cred_header, universal_raw = _header_value_with_source(headers, "x-db-credentials")
+    src_header_name, src_raw = _header_value_with_source(headers, "x-source-db-credentials")
+    tgt_header_name, tgt_raw = _header_value_with_source(headers, "x-target-db-credentials")
+
+    # Normalize all candidates once.
+    universal_norm = _normalize_credentials_value(universal_raw)
+    src_norm = _normalize_credentials_value(src_raw)
+    tgt_norm = _normalize_credentials_value(tgt_raw)
+
+    # Choose credential source:
+    # 1) x-db-credentials
+    # 2) DB-aware pick between source/target fallback headers
+    header_credentials = universal_norm
+    selection_reason = "x-db-credentials"
+    if not header_credentials:
+        src_obj = _try_parse_credentials_json(src_norm)
+        tgt_obj = _try_parse_credentials_json(tgt_norm)
+        src_matches = _credentials_match_db_type(normalized_db, src_obj)
+        tgt_matches = _credentials_match_db_type(normalized_db, tgt_obj)
+
+        if src_matches and not tgt_matches:
+            matched_cred_header = src_header_name or "x-source-db-credentials"
+            header_credentials = src_norm
+            selection_reason = "db-type-matched-source"
+        elif tgt_matches and not src_matches:
+            matched_cred_header = tgt_header_name or "x-target-db-credentials"
+            header_credentials = tgt_norm
+            selection_reason = "db-type-matched-target"
+        elif src_norm:
+            matched_cred_header = src_header_name or "x-source-db-credentials"
+            header_credentials = src_norm
+            selection_reason = "fallback-source-first"
+        elif tgt_norm:
+            matched_cred_header = tgt_header_name or "x-target-db-credentials"
+            header_credentials = tgt_norm
+            selection_reason = "fallback-target"
+
     header_sqlite_path = ""
-    header_credentials = _normalize_credentials_value(header_credentials)
 
     if not header_sqlite_path and normalized_db == "sqlite":
         header_sqlite_path = _header_value(headers, "x-sqlite-path", "x-source-sqlite-path", "x-target-sqlite-path")
@@ -245,10 +305,15 @@ def _resolve_credentials_from_headers(
     logger.info(
         "mcp credential resolution: operation=single db_type=%s expected_headers=%s matched_credential_header=%s credentials_from_headers=%s sqlite_path_from_headers=%s",
         normalized_db,
-        ["x-db-credentials"],
+        ["x-db-credentials", "x-source-db-credentials", "x-target-db-credentials"],
         matched_cred_header or "none",
         bool(header_credentials),
         bool(header_sqlite_path),
+    )
+    logger.info(
+        "mcp credential resolution: operation=single db_type=%s credential_selection_reason=%s",
+        normalized_db,
+        selection_reason if header_credentials else "no-credentials-found",
     )
 
     return resolved_credentials, resolved_sqlite_path
