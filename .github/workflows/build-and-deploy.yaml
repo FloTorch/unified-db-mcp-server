@@ -93,5 +93,5 @@ jobs:
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
       - name: Rollout restart deployment
         run: |
-          kubectl rollout restart deployment/unified_db_mcp_server -n dev
-          kubectl rollout status deployment/unified_db_mcp_server -n dev
+          kubectl rollout restart deployment/unified-db-mcp-server -n dev
+          kubectl rollout status deployment/unified-db-mcp-server -n dev
