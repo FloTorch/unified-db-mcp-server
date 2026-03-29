@@ -17,7 +17,7 @@ jobs:
       AWS_REGION: us-east-1
       ASSUME_ROLE: arn:aws:iam::677276078734:role/flotorch-githubactions-automation-role
       AWS_ACCOUNT_ID: 677276078734
-      ECR_REPOSITORY: flotorch/unified-db-mcp-server
+      ECR_REPOSITORY: flotorch/unifieddbmcpserver
       EKS_CLUSTER_NAME: FloTorch-Internal-cluster-floint
 
     steps:
