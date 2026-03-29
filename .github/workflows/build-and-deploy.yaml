@@ -7,6 +7,11 @@ on:
   push:
     branches:
       - main
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - main
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
@@ -17,7 +22,7 @@ jobs:
       AWS_REGION: us-east-1
       ASSUME_ROLE: arn:aws:iam::677276078734:role/flotorch-githubactions-automation-role
       AWS_ACCOUNT_ID: 677276078734
-      ECR_REPOSITORY: flotorch/unifieddbmcpserver
+      ECR_REPOSITORY: flotorch/unified-db-mcp-server
       EKS_CLUSTER_NAME: FloTorch-Internal-cluster-floint
 
     steps:
@@ -40,7 +45,6 @@ jobs:
       - name: Create and use a new builder instance
         run: |
           docker buildx create --name cache-builder --use
-
       - name: Docker meta
         id: docker_meta
         uses: docker/metadata-action@v5
@@ -69,8 +73,6 @@ jobs:
       AWS_REGION: us-east-1
       ASSUME_ROLE: arn:aws:iam::677276078734:role/flotorch-githubactions-automation-role
       EKS_CLUSTER_NAME: FloTorch-Internal-cluster-floint
-      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'dev' }}
-      K8S_DEPLOYMENT: ${{ vars.K8S_DEPLOYMENT || 'unified-db-mcp-server' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -82,29 +84,14 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: latest
-
+        run: |
+          curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/1.32.3/2025-04-17/bin/linux/amd64/kubectl
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
       - name: Update kubeconfig for EKS
         run: |
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
-
-      - name: Verify cluster connectivity and deployment
-        run: |
-          kubectl version --client
-          kubectl get ns
-          kubectl -n ${{ env.K8S_NAMESPACE }} get deployments
-          kubectl -n ${{ env.K8S_NAMESPACE }} get deployment ${{ env.K8S_DEPLOYMENT }} || {
-            echo "Deployment '${{ env.K8S_DEPLOYMENT }}' not found in namespace '${{ env.K8S_NAMESPACE }}'."
-            echo "Available deployments in namespace '${{ env.K8S_NAMESPACE }}':"
-            kubectl -n ${{ env.K8S_NAMESPACE }} get deployments -o name || true
-            echo "All workloads (Deployments/StatefulSets/DaemonSets) across namespaces:"
-            kubectl get deploy,statefulset,daemonset -A -o wide || true
-            exit 1
-          }
-
       - name: Rollout restart deployment
         run: |
-          kubectl rollout restart deployment/${{ env.K8S_DEPLOYMENT }} -n ${{ env.K8S_NAMESPACE }}
-          kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT }} -n ${{ env.K8S_NAMESPACE }}
+          kubectl rollout restart deployment/unified_db_mcp_server -n dev
+          kubectl rollout status deployment/unified_db_mcp_server -n dev
