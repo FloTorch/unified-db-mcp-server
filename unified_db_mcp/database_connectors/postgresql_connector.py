@@ -15,13 +15,24 @@ class PostgreSQLConnector(DatabaseConnector):
     
     def connect(self, credentials: Dict[str, Any]):
         """Connect to PostgreSQL"""
-        conn = psycopg2.connect(
-            host=credentials.get('host'),
-            port=credentials.get('port', 5432),
-            database=credentials.get('database'),
-            user=credentials.get('user'),
-            password=credentials.get('password')
-        )
+        connection_string = credentials.get("connection_string") or credentials.get("dsn")
+        if connection_string:
+            conn = psycopg2.connect(connection_string)
+            return conn
+
+        conn_params = {
+            "host": credentials.get("host"),
+            "port": credentials.get("port", 5432),
+            "database": credentials.get("database"),
+            "user": credentials.get("user"),
+            "password": credentials.get("password"),
+        }
+        optional_fields = ("sslmode", "sslcert", "sslkey", "sslrootcert", "connect_timeout", "options")
+        for field in optional_fields:
+            if field in credentials and credentials.get(field) is not None:
+                conn_params[field] = credentials.get(field)  
+
+        conn = psycopg2.connect(**conn_params)
         return conn
     
     def extract_schema(self, connection, credentials: Dict[str, Any] = None) -> SchemaInfo:

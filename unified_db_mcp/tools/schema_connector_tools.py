@@ -109,8 +109,21 @@ def apply_schema_tool(
     if not isinstance(schema_data, dict):
         raise ValueError("schema_json must decode to an object")
 
+    # Accept common orchestration payload wrappers.
+    if "migration_preview" in schema_data and isinstance(schema_data["migration_preview"], dict):
+        preview = schema_data["migration_preview"]
+        if isinstance(preview.get("target_schema"), dict):
+            schema_data = preview["target_schema"]
+    elif "target_schema" in schema_data and isinstance(schema_data["target_schema"], dict):
+        schema_data = schema_data["target_schema"]
+
     if "schema" in schema_data and isinstance(schema_data["schema"], dict):
         schema_data = schema_data["schema"]
+
+    # Some clients send table-only schema payloads; infer the target db type.
+    if "database_type" not in schema_data:
+        schema_data = dict(schema_data)
+        schema_data["database_type"] = target_db
 
     schema = _schema_from_dict(schema_data)
     connector = DatabaseConnector.get_connector(target_db)

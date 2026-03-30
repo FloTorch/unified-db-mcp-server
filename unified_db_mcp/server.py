@@ -229,14 +229,74 @@ def _credentials_match_db_type(db_type: str, credentials: dict) -> bool:
     if not credentials:
         return False
     keys = {str(k).lower() for k in credentials.keys()}
+    conn_str = str(credentials.get("connection_string", "") or "").lower().strip()
+    port_value = credentials.get("port")
+    try:
+        port = int(str(port_value).strip()) if port_value is not None else None
+    except Exception:
+        port = None
 
     if key == "supabase":
-        return ("api_key" in keys) or ("key" in keys) or ("connection_string" in keys)
-    if key in {"mysql", "mariadb", "postgresql", "mongodb", "sqlserver", "cassandra"}:
-        return ("host" in keys) or ("connection_string" in keys) or ("user" in keys) or ("username" in keys)
+        return (
+            ("api_key" in keys)
+            or ("key" in keys)
+            or ("project_name" in keys)
+            or ("db_password" in keys)
+            or ("supabase.co" in conn_str)
+        )
+    if key == "postgresql":
+        return (
+            ("sslmode" in keys)
+            or ("options" in keys)
+            or conn_str.startswith("postgresql://")
+            or conn_str.startswith("postgres://")
+            or (port == 5432)
+        )
+    if key in {"mysql", "mariadb"}:
+        return (
+            ("ssl_disabled" in keys)
+            or ("use_pure" in keys)
+            or ("auth_plugin" in keys)
+            or conn_str.startswith("mysql://")
+            or (port in {3306, 3307, 33060, 26561})
+        )
+    if key == "mongodb":
+        return (
+            conn_str.startswith("mongodb://")
+            or conn_str.startswith("mongodb+srv://")
+            or ("authsource" in keys)
+            or ("replicaset" in keys)
+            or (port == 27017)
+        )
+    if key == "sqlserver":
+        return (
+            ("instance" in keys)
+            or ("driver" in keys)
+            or ("trusted_connection" in keys)
+            or ("odbc" in conn_str)
+            or ("driver=" in conn_str)
+            or (port == 1433)
+        )
+    if key == "cassandra":
+        return ("keyspace" in keys) or ("datacenter" in keys) or (port == 9042)
     if key == "sqlite":
         return "database_path" in keys
     return bool(keys)
+
+
+def _normalize_db_type(db_type: str) -> str:
+    """
+    Normalize db type values from clients.
+
+    Accepts values like:
+    - mysql
+    - mysql://railway
+    - postgresql://neondb
+    """
+    value = str(db_type or "").strip().lower()
+    if "://" in value:
+        value = value.split("://", 1)[0].strip()
+    return value
 
 
 def _resolve_credentials_from_headers(
@@ -254,7 +314,7 @@ def _resolve_credentials_from_headers(
     """
     headers = _extract_headers_from_context(ctx)
     _log_headers_snapshot("single", headers)
-    normalized_db = db_type.lower().strip()
+    normalized_db = _normalize_db_type(db_type)
 
     # Universal header-only mode for /unified-db/mcp tool calls.
     matched_cred_header, universal_raw = _header_value_with_source(headers, "x-db-credentials")
@@ -268,31 +328,37 @@ def _resolve_credentials_from_headers(
 
     # Choose credential source:
     # 1) x-db-credentials
-    # 2) DB-aware pick between source/target fallback headers
+    # 2) If both source/target are present, use db-type-aware selection.
+    # 3) If selection is ambiguous, fail fast with a clear error.
     header_credentials = universal_norm
     selection_reason = "x-db-credentials"
     if not header_credentials:
-        src_obj = _try_parse_credentials_json(src_norm)
-        tgt_obj = _try_parse_credentials_json(tgt_norm)
-        src_matches = _credentials_match_db_type(normalized_db, src_obj)
-        tgt_matches = _credentials_match_db_type(normalized_db, tgt_obj)
-
-        if src_matches and not tgt_matches:
-            matched_cred_header = src_header_name or "x-source-db-credentials"
-            header_credentials = src_norm
-            selection_reason = "db-type-matched-source"
-        elif tgt_matches and not src_matches:
-            matched_cred_header = tgt_header_name or "x-target-db-credentials"
-            header_credentials = tgt_norm
-            selection_reason = "db-type-matched-target"
+        if src_norm and tgt_norm:
+            src_obj = _try_parse_credentials_json(src_norm)
+            tgt_obj = _try_parse_credentials_json(tgt_norm)
+            src_matches = _credentials_match_db_type(normalized_db, src_obj)
+            tgt_matches = _credentials_match_db_type(normalized_db, tgt_obj)
+            if src_matches and not tgt_matches:
+                matched_cred_header = src_header_name or "x-source-db-credentials"
+                header_credentials = src_norm
+                selection_reason = "db-type-matched-source"
+            elif tgt_matches and not src_matches:
+                matched_cred_header = tgt_header_name or "x-target-db-credentials"
+                header_credentials = tgt_norm
+                selection_reason = "db-type-matched-target"
+            else:
+                raise ValueError(
+                    "Single-db credential selection is ambiguous. "
+                    "Provide x-db-credentials for single-db tools."
+                )
         elif src_norm:
             matched_cred_header = src_header_name or "x-source-db-credentials"
             header_credentials = src_norm
-            selection_reason = "fallback-source-first"
+            selection_reason = "fallback-source-only"
         elif tgt_norm:
             matched_cred_header = tgt_header_name or "x-target-db-credentials"
             header_credentials = tgt_norm
-            selection_reason = "fallback-target"
+            selection_reason = "fallback-target-only"
 
     header_sqlite_path = ""
 
@@ -330,8 +396,8 @@ def _resolve_migration_credentials_from_headers(
 ) -> tuple[str, str, str, str]:
     headers = _extract_headers_from_context(ctx)
     _log_headers_snapshot("migrate", headers)
-    source_key = source_db.lower().strip()
-    target_key = target_db.lower().strip()
+    source_key = _normalize_db_type(source_db)
+    target_key = _normalize_db_type(target_db)
 
     # Header-only mode for /unified-db/mcp tool calls.
     src_creds_header_name, src_creds_header_raw = _header_value_with_source(headers, "x-source-db-credentials")
@@ -393,20 +459,21 @@ def connect_database(
     ctx: Context = None,
 ) -> str:
     """Connect to a database using connector credentials/config (supports header-based credentials)."""
+    normalized_db = _normalize_db_type(db_type)
     credentials_json, sqlite_path = _resolve_credentials_from_headers(
-        db_type=db_type,
+        db_type=normalized_db,
         credentials_json=credentials_json,
         sqlite_path=sqlite_path,
         ctx=ctx,
     )
     logger.info(
         "connect_database: db_type=%s credentials_from_headers=%s sqlite_path_from_headers=%s",
-        db_type,
+        normalized_db,
         bool(credentials_json),
         bool(sqlite_path),
     )
     return connect_db(
-        db_type=db_type,
+        db_type=normalized_db,
         sqlite_path=sqlite_path or None,
         credentials_json=credentials_json or None,
     )
@@ -421,21 +488,22 @@ def extract_schema(
     ctx: Context = None,
 ) -> str:
     """Extract schema from a source database and return JSON text (supports header-based credentials)."""
+    normalized_db = _normalize_db_type(db_type)
     credentials_json, sqlite_path = _resolve_credentials_from_headers(
-        db_type=db_type,
+        db_type=normalized_db,
         credentials_json=credentials_json,
         sqlite_path=sqlite_path,
         ctx=ctx,
     )
     logger.info(
         "extract_schema: db_type=%s tables=%s credentials_from_headers=%s sqlite_path_from_headers=%s",
-        db_type,
+        normalized_db,
         tables,
         bool(credentials_json),
         bool(sqlite_path),
     )
     return extract_schema_tool(
-        db_type=db_type,
+        db_type=normalized_db,
         tables=tables or None,
         sqlite_path=sqlite_path or None,
         credentials_json=credentials_json or None,
@@ -451,20 +519,21 @@ def apply_schema(
     ctx: Context = None,
 ) -> str:
     """Apply provided schema JSON to target database (supports header-based credentials)."""
+    normalized_target_db = _normalize_db_type(target_db)
     credentials_json, sqlite_path = _resolve_credentials_from_headers(
-        db_type=target_db,
+        db_type=normalized_target_db,
         credentials_json=credentials_json,
         sqlite_path=sqlite_path,
         ctx=ctx,
     )
     logger.info(
         "apply_schema: target_db=%s credentials_from_headers=%s sqlite_path_from_headers=%s",
-        target_db,
+        normalized_target_db,
         bool(credentials_json),
         bool(sqlite_path),
     )
     return apply_schema_tool(
-        target_db=target_db,
+        target_db=normalized_target_db,
         schema_json=schema_json,
         sqlite_path=sqlite_path or None,
         credentials_json=credentials_json or None,
@@ -488,14 +557,16 @@ def migrate_schema(
     High-level migration tool.
     - tables: optional comma-separated names; empty means migrate all tables.
     """
+    normalized_source_db = _normalize_db_type(source_db)
+    normalized_target_db = _normalize_db_type(target_db)
     (
         source_credentials_json,
         target_credentials_json,
         source_sqlite_path,
         target_sqlite_path,
     ) = _resolve_migration_credentials_from_headers(
-        source_db=source_db,
-        target_db=target_db,
+        source_db=normalized_source_db,
+        target_db=normalized_target_db,
         source_credentials_json=source_credentials_json,
         target_credentials_json=target_credentials_json,
         source_sqlite_path=source_sqlite_path,
@@ -504,8 +575,8 @@ def migrate_schema(
     )
     logger.info(
         "migrate_schema: source_db=%s target_db=%s tables=%s dry_run=%s require_confirmation=%s source_credentials_from_headers=%s target_credentials_from_headers=%s source_sqlite_path_from_headers=%s target_sqlite_path_from_headers=%s",
-        source_db,
-        target_db,
+        normalized_source_db,
+        normalized_target_db,
         tables,
         dry_run,
         require_confirmation,
@@ -516,8 +587,8 @@ def migrate_schema(
     )
 
     return migrate_schema_text(
-        source_db=source_db,
-        target_db=target_db,
+        source_db=normalized_source_db,
+        target_db=normalized_target_db,
         tables=tables or None,
         dry_run=dry_run,
         require_confirmation=require_confirmation,

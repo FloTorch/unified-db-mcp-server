@@ -173,7 +173,6 @@ class Config:
             'user': cls.MYSQL_USER,
             'password': cls.MYSQL_PASSWORD,
             'use_pure': True,
-            'ssl_disabled': True
         }
 
     @classmethod
@@ -186,7 +185,6 @@ class Config:
             'user': cls.MARIADB_USER,
             'password': cls.MARIADB_PASSWORD,
             'use_pure': True,
-            'ssl_disabled': True
         }
     
     @classmethod
