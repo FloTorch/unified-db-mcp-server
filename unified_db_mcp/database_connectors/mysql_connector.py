@@ -558,6 +558,27 @@ class MySQLConnector(DatabaseConnector):
                                 # Other timestamp defaults - quote if it's a literal value
                                 escaped = default_str.replace("'", "''")
                                 col_def += f" DEFAULT '{escaped}'"
+                        elif data_type_upper == 'DATE':
+                            default_upper = default_str.upper()
+                            default_lower = default_str.lower()
+                            if default_upper == 'CURRENT_DATE' or default_lower in {'current_date()', 'current_date'}:
+                                col_def += ' DEFAULT CURRENT_DATE'
+                            elif default_upper in {'CURRENT_TIMESTAMP', 'NOW()', 'LOCALTIMESTAMP'} or any(
+                                x in default_lower for x in ['current_timestamp', 'now()', 'now(', 'localtimestamp']
+                            ):
+                                # DATE columns cannot use CURRENT_TIMESTAMP directly in MySQL.
+                                col_def += ' DEFAULT CURRENT_DATE'
+                            elif default_str:
+                                escaped = default_str.replace("'", "''")
+                                col_def += f" DEFAULT '{escaped}'"
+                        elif data_type_upper == 'TIME':
+                            default_upper = default_str.upper()
+                            default_lower = default_str.lower()
+                            if default_upper == 'CURRENT_TIME' or default_lower in {'current_time()', 'current_time'}:
+                                col_def += ' DEFAULT CURRENT_TIME'
+                            elif default_str:
+                                escaped = default_str.replace("'", "''")
+                                col_def += f" DEFAULT '{escaped}'"
                         elif isinstance(col.default_value, str) and not default_str.replace('.', '').replace('-', '').isdigit():
                             # String defaults - escape single quotes
                             escaped = default_str.replace("'", "''")
