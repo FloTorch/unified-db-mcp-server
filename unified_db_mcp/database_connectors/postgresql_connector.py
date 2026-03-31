@@ -274,11 +274,22 @@ class PostgreSQLConnector(DatabaseConnector):
                         # Replace MySQL backticks with PostgreSQL double quotes
                         index_sql = re.sub(r'`([^`]+)`', r'"\1"', index_sql)
                         try:
-                            # Drop index if exists, then create
-                            drop_sql = f'DROP INDEX IF EXISTS "{index_name}"'
-                            cursor.execute(drop_sql)
+                            # Isolate index failures so one bad index does not abort the whole transaction.
+                            cursor.execute("SAVEPOINT sp_create_index")
+                            # Do not drop existing indexes: some are owned by constraints (e.g. unique),
+                            # and dropping them will abort the transaction in PostgreSQL.
+                            if index_name and index_sql.lstrip().upper().startswith("CREATE INDEX"):
+                                index_sql = re.sub(
+                                    r"^CREATE\s+INDEX\s+",
+                                    "CREATE INDEX IF NOT EXISTS ",
+                                    index_sql,
+                                    flags=re.IGNORECASE,
+                                )
                             cursor.execute(index_sql)
+                            cursor.execute("RELEASE SAVEPOINT sp_create_index")
                         except Exception as idx_error:
+                            cursor.execute("ROLLBACK TO SAVEPOINT sp_create_index")
+                            cursor.execute("RELEASE SAVEPOINT sp_create_index")
                             logger.warning(f"  Could not create index '{index_name}' for '{table_info.name}': {idx_error}")
                 
                 # Add foreign key constraints
