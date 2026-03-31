@@ -562,12 +562,21 @@ class MySQLConnector(DatabaseConnector):
                             default_upper = default_str.upper()
                             default_lower = default_str.lower()
                             if default_upper == 'CURRENT_DATE' or default_lower in {'current_date()', 'current_date'}:
-                                col_def += ' DEFAULT CURRENT_DATE'
+                                # CURRENT_DATE default syntax support varies by MySQL version/mode.
+                                # Skip to keep generated DDL broadly compatible.
+                                logger.debug(
+                                    "  Skipping dynamic DATE default for column '%s' to avoid MySQL syntax incompatibility",
+                                    col.name,
+                                )
                             elif default_upper in {'CURRENT_TIMESTAMP', 'NOW()', 'LOCALTIMESTAMP'} or any(
                                 x in default_lower for x in ['current_timestamp', 'now()', 'now(', 'localtimestamp']
                             ):
-                                # DATE columns cannot use CURRENT_TIMESTAMP directly in MySQL.
-                                col_def += ' DEFAULT CURRENT_DATE'
+                                # DATE columns cannot reliably use dynamic timestamp/date defaults across versions.
+                                logger.debug(
+                                    "  Skipping dynamic DATE default for column '%s' (source default=%s)",
+                                    col.name,
+                                    default_str,
+                                )
                             elif default_str:
                                 escaped = default_str.replace("'", "''")
                                 col_def += f" DEFAULT '{escaped}'"
