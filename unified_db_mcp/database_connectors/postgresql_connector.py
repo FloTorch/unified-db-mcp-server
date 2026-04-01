@@ -1,6 +1,7 @@
 """PostgreSQL database connector"""
 import logging
 import re
+import hashlib
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import Dict, Any
@@ -56,6 +57,36 @@ class PostgreSQLConnector(DatabaseConnector):
             
             table_infos = []
             for table_name in tables:
+                # Get foreign keys for this table once (including ON UPDATE/ON DELETE rules).
+                cursor.execute("""
+                    SELECT
+                        kcu.column_name AS local_column_name,
+                        ccu.table_name AS foreign_table_name,
+                        ccu.column_name AS foreign_column_name,
+                        rc.update_rule,
+                        rc.delete_rule
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                        ON tc.constraint_name = kcu.constraint_name
+                        AND tc.table_schema = kcu.table_schema
+                    JOIN information_schema.referential_constraints rc
+                        ON tc.constraint_name = rc.constraint_name
+                        AND tc.table_schema = rc.constraint_schema
+                    JOIN information_schema.key_column_usage ccu
+                        ON rc.unique_constraint_name = ccu.constraint_name
+                        AND rc.unique_constraint_schema = ccu.table_schema
+                        AND kcu.position_in_unique_constraint = ccu.ordinal_position
+                    WHERE tc.table_schema = 'public'
+                      AND tc.table_name = %s
+                      AND tc.constraint_type = 'FOREIGN KEY'
+                """, (table_name,))
+                fk_rows = cursor.fetchall()
+                fk_by_column = {
+                    row['local_column_name']: row
+                    for row in fk_rows
+                    if row.get('local_column_name')
+                }
+
                 # Get columns
                 cursor.execute("""
                     SELECT 
@@ -86,23 +117,7 @@ class PostgreSQLConnector(DatabaseConnector):
                     """, (table_name, col['column_name']))
                     is_pk = cursor.fetchone()['count'] > 0
                     
-                    # Check for foreign key
-                    cursor.execute("""
-                        SELECT 
-                            kcu2.table_name AS foreign_table_name,
-                            kcu2.column_name AS foreign_column_name
-                        FROM information_schema.table_constraints AS tc
-                        JOIN information_schema.key_column_usage AS kcu
-                        ON tc.constraint_name = kcu.constraint_name
-                        JOIN information_schema.referential_constraints AS rc
-                        ON tc.constraint_name = rc.constraint_name
-                        JOIN information_schema.key_column_usage AS kcu2
-                        ON rc.unique_constraint_name = kcu2.constraint_name
-                        WHERE tc.constraint_type = 'FOREIGN KEY'
-                        AND tc.table_name = %s
-                        AND kcu.column_name = %s
-                    """, (table_name, col['column_name']))
-                    fk_info = cursor.fetchone()
+                    fk_info = fk_by_column.get(col['column_name'])
                     
                     column_info = ColumnInfo(
                         name=col['column_name'],
@@ -115,7 +130,9 @@ class PostgreSQLConnector(DatabaseConnector):
                         is_primary_key=is_pk,
                         is_foreign_key=fk_info is not None,
                         foreign_key_table=fk_info['foreign_table_name'] if fk_info else None,
-                        foreign_key_column=fk_info['foreign_column_name'] if fk_info else None
+                        foreign_key_column=fk_info['foreign_column_name'] if fk_info else None,
+                        foreign_key_on_delete=fk_info['delete_rule'] if fk_info else None,
+                        foreign_key_on_update=fk_info['update_rule'] if fk_info else None,
                     )
                     columns.append(column_info)
                 
@@ -150,6 +167,7 @@ class PostgreSQLConnector(DatabaseConnector):
         cursor = connection.cursor()
         
         try:
+            pending_foreign_keys = []
             for table_info in schema.tables:
                 # Build CREATE TABLE statement
                 column_defs = []
@@ -292,16 +310,91 @@ class PostgreSQLConnector(DatabaseConnector):
                             cursor.execute("RELEASE SAVEPOINT sp_create_index")
                             logger.warning(f"  Could not create index '{index_name}' for '{table_info.name}': {idx_error}")
                 
-                # Add foreign key constraints
+                # Defer foreign key creation until all tables are created.
                 for col in table_info.columns:
                     if col.is_foreign_key and col.foreign_key_table and col.foreign_key_column:
-                        fk_sql = f"""
-                            ALTER TABLE "{table_info.name}"
-                            ADD CONSTRAINT fk_{table_info.name}_{col.name}
-                            FOREIGN KEY ("{col.name}")
-                            REFERENCES "{col.foreign_key_table}" ("{col.foreign_key_column}")
+                        pending_foreign_keys.append((table_info.name, col))
+
+            for table_name, col in pending_foreign_keys:
+                raw_fk_name = f"fk_{table_name}_{col.name}_{col.foreign_key_table}_{col.foreign_key_column}"
+                if len(raw_fk_name) > 60:
+                    digest = hashlib.md5(raw_fk_name.encode("utf-8")).hexdigest()[:8]
+                    raw_fk_name = f"fk_{table_name}_{col.name}_{digest}"
+                fk_name = raw_fk_name[:63]
+                valid_fk_actions = {"CASCADE", "RESTRICT", "SET NULL", "SET DEFAULT", "NO ACTION"}
+
+                try:
+                    cursor.execute("SAVEPOINT sp_create_fk")
+                    # Ensure both local and referenced columns still exist.
+                    cursor.execute(
                         """
-                        cursor.execute(fk_sql)
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_schema = 'public'
+                              AND table_name = %s
+                              AND column_name = %s
+                        )
+                        """,
+                        (table_name, col.name),
+                    )
+                    local_col_exists = cursor.fetchone()[0]
+                    cursor.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_schema = 'public'
+                              AND table_name = %s
+                              AND column_name = %s
+                        )
+                        """,
+                        (col.foreign_key_table, col.foreign_key_column),
+                    )
+                    ref_col_exists = cursor.fetchone()[0]
+                    if not local_col_exists or not ref_col_exists:
+                        cursor.execute("RELEASE SAVEPOINT sp_create_fk")
+                        logger.warning(
+                            f"  Skipping foreign key '{table_name}.{col.name}' -> "
+                            f"'{col.foreign_key_table}.{col.foreign_key_column}' (column/table missing)"
+                        )
+                        continue
+
+                    cursor.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM information_schema.table_constraints
+                            WHERE table_schema = 'public'
+                              AND table_name = %s
+                              AND constraint_name = %s
+                              AND constraint_type = 'FOREIGN KEY'
+                        )
+                        """,
+                        (table_name, fk_name),
+                    )
+                    if cursor.fetchone()[0]:
+                        cursor.execute("RELEASE SAVEPOINT sp_create_fk")
+                        continue
+
+                    fk_sql = f'''
+                        ALTER TABLE "{table_name}"
+                        ADD CONSTRAINT "{fk_name}"
+                        FOREIGN KEY ("{col.name}")
+                        REFERENCES "{col.foreign_key_table}" ("{col.foreign_key_column}")
+                    '''
+                    on_delete = (col.foreign_key_on_delete or "").strip().upper()
+                    on_update = (col.foreign_key_on_update or "").strip().upper()
+                    if on_delete in valid_fk_actions:
+                        fk_sql += f" ON DELETE {on_delete}"
+                    if on_update in valid_fk_actions:
+                        fk_sql += f" ON UPDATE {on_update}"
+                    cursor.execute(fk_sql)
+                    cursor.execute("RELEASE SAVEPOINT sp_create_fk")
+                except Exception as fk_error:
+                    cursor.execute("ROLLBACK TO SAVEPOINT sp_create_fk")
+                    cursor.execute("RELEASE SAVEPOINT sp_create_fk")
+                    logger.warning(f"  Could not create foreign key for '{table_name}.{col.name}': {fk_error}")
             
             connection.commit()
             logger.info(f"Schema applied successfully to {schema.database_name}")
