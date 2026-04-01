@@ -544,7 +544,11 @@ def convert_schema_to_mysql(supabase_schema: SchemaInfo) -> SchemaInfo:
                 numeric_precision=col.numeric_precision,
                 numeric_scale=col.numeric_scale,
                 is_primary_key=col.is_primary_key,
-                is_foreign_key=col.is_foreign_key
+                is_foreign_key=col.is_foreign_key,
+                foreign_key_table=col.foreign_key_table,
+                foreign_key_column=col.foreign_key_column,
+                foreign_key_on_delete=col.foreign_key_on_delete,
+                foreign_key_on_update=col.foreign_key_on_update,
             )
             mysql_columns.append(mysql_col)
         
@@ -621,7 +625,11 @@ def convert_schema_to_supabase(mysql_schema: SchemaInfo) -> SchemaInfo:
                 numeric_precision=col.numeric_precision,
                 numeric_scale=col.numeric_scale,
                 is_primary_key=col.is_primary_key,
-                is_foreign_key=col.is_foreign_key
+                is_foreign_key=col.is_foreign_key,
+                foreign_key_table=col.foreign_key_table,
+                foreign_key_column=col.foreign_key_column,
+                foreign_key_on_delete=col.foreign_key_on_delete,
+                foreign_key_on_update=col.foreign_key_on_update,
             )
             postgres_columns.append(postgres_col)
         
@@ -933,7 +941,11 @@ def convert_schema_between_databases(
                 numeric_precision=col.numeric_precision,
                 numeric_scale=col.numeric_scale,
                 is_primary_key=col.is_primary_key,
-                is_foreign_key=col.is_foreign_key
+                is_foreign_key=col.is_foreign_key,
+                foreign_key_table=col.foreign_key_table,
+                foreign_key_column=col.foreign_key_column,
+                foreign_key_on_delete=col.foreign_key_on_delete,
+                foreign_key_on_update=col.foreign_key_on_update,
             )
             target_columns.append(target_col)
         
