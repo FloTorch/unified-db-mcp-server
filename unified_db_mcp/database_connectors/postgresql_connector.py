@@ -169,6 +169,27 @@ class PostgreSQLConnector(DatabaseConnector):
         try:
             pending_foreign_keys = []
             for table_info in schema.tables:
+                # Ensure sequences referenced by nextval(...) defaults exist before table creation.
+                sequences_to_create = set()
+                for col in table_info.columns:
+                    if not col.default_value:
+                        continue
+                    default_str = str(col.default_value)
+                    seq_match = re.search(r"nextval\s*\(\s*'([^']+)'", default_str, re.IGNORECASE)
+                    if seq_match:
+                        sequences_to_create.add(seq_match.group(1))
+
+                for seq_name in sequences_to_create:
+                    try:
+                        # Handle names like "public.pages_id_seq" or "pages_id_seq".
+                        if "." in seq_name:
+                            seq_schema, seq_obj = seq_name.split(".", 1)
+                            cursor.execute(f'CREATE SEQUENCE IF NOT EXISTS "{seq_schema}"."{seq_obj}"')
+                        else:
+                            cursor.execute(f'CREATE SEQUENCE IF NOT EXISTS "{seq_name}"')
+                    except Exception as seq_error:
+                        logger.warning(f"  Could not create sequence '{seq_name}' for '{table_info.name}': {seq_error}")
+
                 # Build CREATE TABLE statement
                 column_defs = []
                 for col in table_info.columns:
