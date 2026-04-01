@@ -255,6 +255,38 @@ class SupabaseConnector(DatabaseConnector):
             
             table_infos = []
             for table_name in tables:
+                cursor.execute("""
+                    SELECT
+                        kcu.column_name,
+                        ccu.table_name AS foreign_table_name,
+                        ccu.column_name AS foreign_column_name,
+                        rc.update_rule,
+                        rc.delete_rule
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                        ON tc.constraint_name = kcu.constraint_name
+                        AND tc.table_schema = kcu.table_schema
+                    JOIN information_schema.referential_constraints rc
+                        ON tc.constraint_name = rc.constraint_name
+                        AND tc.table_schema = rc.constraint_schema
+                    JOIN information_schema.constraint_column_usage ccu
+                        ON rc.unique_constraint_name = ccu.constraint_name
+                        AND rc.unique_constraint_schema = ccu.constraint_schema
+                    WHERE tc.table_schema = 'public'
+                        AND tc.table_name = %s
+                        AND tc.constraint_type = 'FOREIGN KEY'
+                """, (table_name,))
+                fk_rows = cursor.fetchall()
+                fk_by_column = {
+                    row['column_name']: {
+                        'foreign_table_name': row['foreign_table_name'],
+                        'foreign_column_name': row['foreign_column_name'],
+                        'on_update': row.get('update_rule'),
+                        'on_delete': row.get('delete_rule'),
+                    }
+                    for row in fk_rows
+                }
+
                 # Get columns
                 cursor.execute("""
                     SELECT 
@@ -284,6 +316,7 @@ class SupabaseConnector(DatabaseConnector):
                         AND tc.constraint_type = 'PRIMARY KEY'
                     """, (table_name, col['column_name']))
                     is_pk = cursor.fetchone()['count'] > 0
+                    fk_info = fk_by_column.get(col['column_name'])
                     
                     column_info = ColumnInfo(
                         name=col['column_name'],
@@ -293,7 +326,12 @@ class SupabaseConnector(DatabaseConnector):
                         character_maximum_length=col['character_maximum_length'],
                         numeric_precision=col['numeric_precision'],
                         numeric_scale=col['numeric_scale'],
-                        is_primary_key=is_pk
+                        is_primary_key=is_pk,
+                        is_foreign_key=fk_info is not None,
+                        foreign_key_table=fk_info['foreign_table_name'] if fk_info else None,
+                        foreign_key_column=fk_info['foreign_column_name'] if fk_info else None,
+                        foreign_key_on_delete=fk_info['on_delete'] if fk_info else None,
+                        foreign_key_on_update=fk_info['on_update'] if fk_info else None,
                     )
                     columns.append(column_info)
                 
@@ -886,9 +924,17 @@ class SupabaseConnector(DatabaseConnector):
                             if columns:
                                 # Get primary key information
                                 pk_columns = self._get_primary_keys(base_url, headers, table_name)
+                                fk_columns = self._get_foreign_keys(base_url, headers, table_name)
                                 for col in columns:
                                     if col.name in pk_columns:
                                         col.is_primary_key = True
+                                    fk_info = fk_columns.get(col.name)
+                                    if fk_info:
+                                        col.is_foreign_key = True
+                                        col.foreign_key_table = fk_info.get('foreign_table_name')
+                                        col.foreign_key_column = fk_info.get('foreign_column_name')
+                                        col.foreign_key_on_delete = fk_info.get('on_delete')
+                                        col.foreign_key_on_update = fk_info.get('on_update')
                                 
                                 logger.info(f"  Got schema for '{table_name}' ({len(columns)} columns) via information_schema")
                                 return columns
@@ -1025,9 +1071,17 @@ class SupabaseConnector(DatabaseConnector):
                                 if columns:
                                     # Get primary keys
                                     pk_columns = self._get_primary_keys(base_url, headers, table_name)
+                                    fk_columns = self._get_foreign_keys(base_url, headers, table_name)
                                     for col in columns:
                                         if col.name in pk_columns:
                                             col.is_primary_key = True
+                                        fk_info = fk_columns.get(col.name)
+                                        if fk_info:
+                                            col.is_foreign_key = True
+                                            col.foreign_key_table = fk_info.get('foreign_table_name')
+                                            col.foreign_key_column = fk_info.get('foreign_column_name')
+                                            col.foreign_key_on_delete = fk_info.get('on_delete')
+                                            col.foreign_key_on_update = fk_info.get('on_update')
                                     
                                     logger.info(f"  Got schema for '{table_name}' ({len(columns)} columns) via pg_attribute")
                                     return columns
@@ -1116,6 +1170,97 @@ class SupabaseConnector(DatabaseConnector):
         
         # Fallback: assume 'id' is primary key if it exists
         return []
+
+    def _get_foreign_keys(self, base_url: str, headers: Dict[str, str], table_name: str) -> Dict[str, Dict[str, Any]]:
+        """Get foreign key metadata keyed by local column name."""
+        try:
+            info_headers = {
+                **headers,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+
+            tc_url = f"{base_url}/rest/v1/information_schema.table_constraints"
+            tc_params = {
+                "table_schema": "eq.public",
+                "table_name": f"eq.{table_name}",
+                "constraint_type": "eq.FOREIGN KEY",
+                "select": "constraint_name",
+            }
+            tc_response = requests.get(tc_url, headers=info_headers, params=tc_params, timeout=10, verify=False)
+            if tc_response.status_code != 200:
+                return {}
+
+            constraints = [row.get("constraint_name") for row in tc_response.json() if row.get("constraint_name")]
+            if not constraints:
+                return {}
+            in_constraints = ",".join(constraints)
+
+            kcu_url = f"{base_url}/rest/v1/information_schema.key_column_usage"
+            kcu_params = {
+                "table_schema": "eq.public",
+                "table_name": f"eq.{table_name}",
+                "constraint_name": f"in.({in_constraints})",
+                "select": "constraint_name,column_name,ordinal_position",
+            }
+            kcu_response = requests.get(kcu_url, headers=info_headers, params=kcu_params, timeout=10, verify=False)
+            if kcu_response.status_code != 200:
+                return {}
+            kcu_rows = [row for row in kcu_response.json() if row.get("constraint_name") and row.get("column_name")]
+            if not kcu_rows:
+                return {}
+
+            rc_url = f"{base_url}/rest/v1/information_schema.referential_constraints"
+            rc_params = {
+                "constraint_schema": "eq.public",
+                "constraint_name": f"in.({in_constraints})",
+                "select": "constraint_name,unique_constraint_name,update_rule,delete_rule",
+            }
+            rc_response = requests.get(rc_url, headers=info_headers, params=rc_params, timeout=10, verify=False)
+            if rc_response.status_code != 200:
+                return {}
+            rc_rows = [row for row in rc_response.json() if row.get("constraint_name") and row.get("unique_constraint_name")]
+            if not rc_rows:
+                return {}
+            rc_by_constraint = {row["constraint_name"]: row for row in rc_rows}
+
+            unique_constraint_names = sorted({row["unique_constraint_name"] for row in rc_rows})
+            if not unique_constraint_names:
+                return {}
+            in_unique_constraints = ",".join(unique_constraint_names)
+
+            ccu_url = f"{base_url}/rest/v1/information_schema.constraint_column_usage"
+            ccu_params = {
+                "constraint_schema": "eq.public",
+                "constraint_name": f"in.({in_unique_constraints})",
+                "select": "constraint_name,table_name,column_name",
+            }
+            ccu_response = requests.get(ccu_url, headers=info_headers, params=ccu_params, timeout=10, verify=False)
+            if ccu_response.status_code != 200:
+                return {}
+            ccu_rows = [row for row in ccu_response.json() if row.get("constraint_name")]
+            ccu_by_constraint = {row["constraint_name"]: row for row in ccu_rows}
+
+            fk_by_column: Dict[str, Dict[str, Any]] = {}
+            for row in kcu_rows:
+                constraint_name = row["constraint_name"]
+                rc_row = rc_by_constraint.get(constraint_name)
+                if not rc_row:
+                    continue
+                referenced = ccu_by_constraint.get(rc_row["unique_constraint_name"])
+                if not referenced:
+                    continue
+                fk_by_column[row["column_name"]] = {
+                    "foreign_table_name": referenced.get("table_name"),
+                    "foreign_column_name": referenced.get("column_name"),
+                    "on_update": rc_row.get("update_rule"),
+                    "on_delete": rc_row.get("delete_rule"),
+                }
+
+            return fk_by_column
+        except Exception as e:
+            logger.debug(f"  Could not get foreign keys for {table_name}: {e}")
+            return {}
     
     def _infer_columns_from_data(self, data: List[Dict]) -> List[ColumnInfo]:
         """Infer column schema from sample data"""
@@ -1411,6 +1556,7 @@ class SupabaseConnector(DatabaseConnector):
         cursor = pg_conn.cursor()
         
         try:
+            pending_foreign_keys = []
             for table_info in schema.tables:
                 try:
                     # Check if table exists
@@ -1514,6 +1660,11 @@ class SupabaseConnector(DatabaseConnector):
                     # CRITICAL: Commit table creation immediately to ensure it's saved
                     pg_conn.commit()
                     logger.info(f"  Created table '{table_info.name}' with {len(table_info.columns)} columns")
+
+                    # Defer FK creation until all tables exist.
+                    for col in table_info.columns:
+                        if col.is_foreign_key and col.foreign_key_table and col.foreign_key_column:
+                            pending_foreign_keys.append((table_info.name, col))
                     
                     # Create indexes in separate transactions (using savepoints for safety)
                     for idx_num, index in enumerate(table_info.indexes):
@@ -1572,6 +1723,99 @@ class SupabaseConnector(DatabaseConnector):
                     logger.debug(f"  Traceback: {traceback.format_exc()}")
                     # Continue with next table instead of failing completely
                     continue
+
+            # Add foreign keys after all tables are created.
+            # This avoids ordering issues when child table is created before parent table.
+            import hashlib
+            for table_name, col in pending_foreign_keys:
+                savepoint_name = f"fk_{table_name}_{col.name}"
+                valid_fk_actions = {"CASCADE", "RESTRICT", "SET NULL", "SET DEFAULT", "NO ACTION"}
+                # Keep constraint name under PostgreSQL 63-char limit.
+                base_name = f"fk_{table_name}_{col.name}_{col.foreign_key_table}_{col.foreign_key_column}"
+                if len(base_name) > 60:
+                    digest = hashlib.md5(base_name.encode("utf-8")).hexdigest()[:8]
+                    base_name = f"fk_{table_name}_{col.name}_{digest}"
+                fk_name = base_name[:63]
+
+                try:
+                    cursor.execute(f"SAVEPOINT {savepoint_name}")
+                    # Ensure both local and referenced columns still exist.
+                    cursor.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_schema = 'public'
+                              AND table_name = %s
+                              AND column_name = %s
+                        )
+                        """,
+                        (table_name, col.name),
+                    )
+                    local_col_exists = cursor.fetchone()[0]
+                    cursor.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_schema = 'public'
+                              AND table_name = %s
+                              AND column_name = %s
+                        )
+                        """,
+                        (col.foreign_key_table, col.foreign_key_column),
+                    )
+                    ref_col_exists = cursor.fetchone()[0]
+                    if not local_col_exists or not ref_col_exists:
+                        cursor.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                        logger.warning(
+                            f"  Skipping foreign key '{table_name}.{col.name}' -> "
+                            f"'{col.foreign_key_table}.{col.foreign_key_column}' (column/table missing)"
+                        )
+                        continue
+
+                    cursor.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM information_schema.table_constraints
+                            WHERE table_schema = 'public'
+                              AND table_name = %s
+                              AND constraint_name = %s
+                              AND constraint_type = 'FOREIGN KEY'
+                        )
+                        """,
+                        (table_name, fk_name),
+                    )
+                    if cursor.fetchone()[0]:
+                        cursor.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                        continue
+
+                    fk_sql = f'''
+                        ALTER TABLE "{table_name}"
+                        ADD CONSTRAINT "{fk_name}"
+                        FOREIGN KEY ("{col.name}")
+                        REFERENCES "{col.foreign_key_table}" ("{col.foreign_key_column}")
+                    '''
+                    on_delete = (col.foreign_key_on_delete or "").strip().upper()
+                    on_update = (col.foreign_key_on_update or "").strip().upper()
+                    if on_delete in valid_fk_actions:
+                        fk_sql += f" ON DELETE {on_delete}"
+                    if on_update in valid_fk_actions:
+                        fk_sql += f" ON UPDATE {on_update}"
+
+                    cursor.execute(fk_sql)
+                    cursor.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                    pg_conn.commit()
+                    logger.debug(f"  Created foreign key '{fk_name}' for '{table_name}.{col.name}'")
+                except Exception as fk_error:
+                    try:
+                        cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                        cursor.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                        pg_conn.commit()
+                    except Exception:
+                        pass
+                    logger.warning(f"  Could not create foreign key for '{table_name}.{col.name}': {fk_error}")
             
             logger.info(f"Schema applied successfully to Supabase project '{project_ref}'")
             
