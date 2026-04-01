@@ -54,70 +54,79 @@ def migrate_schema_details(
     source_sqlite_path: Optional[str] = None,
     target_sqlite_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if require_confirmation:
-        raise ValueError("require_confirmation is not supported in MCP header-driven mode")
-
-    source_connector = DatabaseConnector.get_connector(source_db)
-    target_connector = DatabaseConnector.get_connector(target_db)
-
-    source_credentials = _build_credentials_from_json(
-        db_type=source_db,
-        credentials_json=source_credentials_json,
-        sqlite_path=source_sqlite_path,
-    )
-    target_credentials = _build_credentials_from_json(
-        db_type=target_db,
-        credentials_json=target_credentials_json,
-        sqlite_path=target_sqlite_path,
-    )
-
-    source_connection = source_connector.connect(source_credentials)
     try:
-        source_schema = source_connector.extract_schema(source_connection, source_credentials)
-    finally:
-        if hasattr(source_connection, "close"):
-            source_connection.close()
+        if require_confirmation:
+            raise ValueError("require_confirmation is not supported in MCP header-driven mode")
 
-    table_names = parse_tables_arg(tables)
-    if table_names:
-        source_schema.tables = [t for t in source_schema.tables if t.name in table_names]
+        source_connector = DatabaseConnector.get_connector(source_db)
+        target_connector = DatabaseConnector.get_connector(target_db)
 
-    if not source_schema.tables:
-        return {
-            "success": False,
-            "result": f"Migration failed: no tables found for {source_db}",
-            "tables": [],
-            "table_count": 0,
-        }
+        source_credentials = _build_credentials_from_json(
+            db_type=source_db,
+            credentials_json=source_credentials_json,
+            sqlite_path=source_sqlite_path,
+        )
+        target_credentials = _build_credentials_from_json(
+            db_type=target_db,
+            credentials_json=target_credentials_json,
+            sqlite_path=target_sqlite_path,
+        )
 
-    target_schema = convert_schema_between_databases(
-        source_schema=source_schema,
-        source_db_type=source_db,
-        target_db_type=target_db,
-    )
-    migrated_tables = [t.name for t in target_schema.tables]
+        source_connection = source_connector.connect(source_credentials)
+        try:
+            source_schema = source_connector.extract_schema(source_connection, source_credentials)
+        finally:
+            if hasattr(source_connection, "close"):
+                source_connection.close()
 
-    if dry_run:
+        table_names = parse_tables_arg(tables)
+        if table_names:
+            source_schema.tables = [t for t in source_schema.tables if t.name in table_names]
+
+        if not source_schema.tables:
+            return {
+                "success": False,
+                "result": f"Migration failed: no tables found for {source_db}",
+                "tables": [],
+                "table_count": 0,
+            }
+
+        target_schema = convert_schema_between_databases(
+            source_schema=source_schema,
+            source_db_type=source_db,
+            target_db_type=target_db,
+        )
+        migrated_tables = [t.name for t in target_schema.tables]
+
+        if dry_run:
+            return {
+                "success": True,
+                "result": f"Migration completed: {source_db} -> {target_db} (dry-run)",
+                "tables": migrated_tables,
+                "table_count": len(migrated_tables),
+            }
+
+        target_connection = target_connector.connect(target_credentials)
+        try:
+            target_connector.apply_schema(target_connection, target_schema, target_credentials)
+        finally:
+            if hasattr(target_connection, "close"):
+                target_connection.close()
+
         return {
             "success": True,
-            "result": f"Migration completed: {source_db} -> {target_db} (dry-run)",
+            "result": f"Migration completed: {source_db} -> {target_db}",
             "tables": migrated_tables,
             "table_count": len(migrated_tables),
         }
-
-    target_connection = target_connector.connect(target_credentials)
-    try:
-        target_connector.apply_schema(target_connection, target_schema, target_credentials)
-    finally:
-        if hasattr(target_connection, "close"):
-            target_connection.close()
-
-    return {
-        "success": True,
-        "result": f"Migration completed: {source_db} -> {target_db}",
-        "tables": migrated_tables,
-        "table_count": len(migrated_tables),
-    }
+    except KeyError as exc:
+        # Prevent opaque responses like "Error executing tool migrate_schema: 0".
+        missing_key = exc.args[0] if exc.args else "<unknown>"
+        raise ValueError(
+            f"Migration failed due to missing expected key/index '{missing_key}' "
+            f"while processing {source_db} -> {target_db}. "
+            "Please verify source/target credential headers match source_db/target_db."
+        ) from exc
 
 
 def _build_credentials_from_json(
