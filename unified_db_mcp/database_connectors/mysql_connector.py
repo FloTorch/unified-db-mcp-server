@@ -134,12 +134,12 @@ class MySQLConnector(DatabaseConnector):
                 # Build a map of column_name -> foreign key info
                 fk_map = {}
                 for fk_row in cursor.fetchall():
-                    col_name = fk_row[0]
+                    col_name = fk_row['COLUMN_NAME']
                     fk_map[col_name] = {
-                        'table': fk_row[1],
-                        'column': fk_row[2],
-                        'on_delete': fk_row[3] if fk_row[3] else 'RESTRICT',
-                        'on_update': fk_row[4] if fk_row[4] else 'RESTRICT'
+                        'table': fk_row['REFERENCED_TABLE_NAME'],
+                        'column': fk_row['REFERENCED_COLUMN_NAME'],
+                        'on_delete': fk_row['DELETE_RULE'] if fk_row['DELETE_RULE'] else 'RESTRICT',
+                        'on_update': fk_row['UPDATE_RULE'] if fk_row['UPDATE_RULE'] else 'RESTRICT'
                     }
                 
                 columns = []
