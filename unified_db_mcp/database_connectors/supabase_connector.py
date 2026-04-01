@@ -24,6 +24,26 @@ logger = logging.getLogger(__name__)
 
 class SupabaseConnector(DatabaseConnector):
     """Supabase connector - uses REST API to fetch schema"""
+
+    @staticmethod
+    def _normalize_region(raw_region: str) -> str:
+        """Normalize Supabase/API region hints to pooler region token."""
+        value = (raw_region or "").strip().lower()
+        if not value:
+            return "ap-southeast-1"
+        if "ap-south-1" in value or "mumbai" in value:
+            return "ap-south-1"
+        if "ap-southeast-1" in value or "singapore" in value:
+            return "ap-southeast-1"
+        if "us-east-1" in value:
+            return "us-east-1"
+        if "us-west-1" in value:
+            return "us-west-1"
+        if "eu-west-1" in value:
+            return "eu-west-1"
+        if "ap-northeast-1" in value:
+            return "ap-northeast-1"
+        return raw_region
     
     def connect(self, credentials: Dict[str, Any]):
         """Connect to Supabase"""
@@ -41,6 +61,7 @@ class SupabaseConnector(DatabaseConnector):
             raise ValueError("Supabase API key is required")
         
         project_name = credentials.get('project_name') if credentials else None
+        explicit_project_ref = credentials.get('project_ref') if credentials else None
         table_names = credentials.get('table_names') if credentials else None
         if table_names and isinstance(table_names, str):
             table_names = [t.strip() for t in table_names.split(',') if t.strip()]
@@ -55,9 +76,34 @@ class SupabaseConnector(DatabaseConnector):
                 project_ref_from_conn = match.group(1)
                 logger.info(f"Extracted project_ref '{project_ref_from_conn}' from connection string")
         
-        # Get projects
-        projects = get_all_supabase_projects(api_key)
-        if not projects:
+        # If project_ref is explicitly provided in credentials, trust it first.
+        if explicit_project_ref:
+            project_ref = explicit_project_ref
+            project_name_display = project_name or explicit_project_ref
+            logger.info(f"Using explicit project_ref from credentials: {project_ref}")
+            projects = []
+            # Try to resolve region for explicit project_ref when user did not provide one.
+            if credentials is not None and not credentials.get("region"):
+                try:
+                    all_projects = get_all_supabase_projects(api_key)
+                    matched = next(
+                        (p for p in all_projects if (p.get("ref") or p.get("id")) == explicit_project_ref),
+                        None,
+                    )
+                    if matched:
+                        api_region = matched.get("region") or matched.get("cloud_provider")
+                        if api_region:
+                            credentials["region"] = self._normalize_region(api_region)
+                            logger.info(
+                                f"Resolved region '{credentials['region']}' for explicit project_ref '{explicit_project_ref}'"
+                            )
+                except Exception as region_lookup_error:
+                    logger.debug(f"Could not resolve region for explicit project_ref: {region_lookup_error}")
+        else:
+            # Get projects
+            projects = get_all_supabase_projects(api_key)
+
+        if not explicit_project_ref and not projects:
             # API call failed (401, 502, 503, etc.) - try fallback methods
             if project_ref_from_conn:
                 # Use project ref from connection string (most reliable)
@@ -77,7 +123,7 @@ class SupabaseConnector(DatabaseConnector):
                     "  2. Provide SUPABASE_PROJECT=your-project-ref\n"
                     "  3. Use SUPABASE_CONNECTION_STRING=postgresql://..."
                 )
-        else:
+        elif not explicit_project_ref:
             # API succeeded - map project name to project ref
             if project_name:
                 projects = [p for p in projects if p.get('name', '').lower() == project_name.lower() or 
@@ -90,6 +136,15 @@ class SupabaseConnector(DatabaseConnector):
             project_ref = project.get('ref') or project.get('id')
             project_name_display = project.get('name', 'Unknown')
             logger.info(f"Found project: '{project_name_display}' (ref: {project_ref})")
+
+            # Propagate discovered project_ref/region back into credentials so
+            # db_password flow can build a correct direct PostgreSQL pooler URL.
+            if credentials is not None:
+                credentials.setdefault("project_ref", project_ref)
+                if not credentials.get("region"):
+                    api_region = project.get("region") or project.get("cloud_provider")
+                    if api_region:
+                        credentials["region"] = self._normalize_region(api_region)
         project_url = f"https://{project_ref}.supabase.co"
         
         # Get project API keys
@@ -97,22 +152,51 @@ class SupabaseConnector(DatabaseConnector):
         project_api_key = (project_keys.get('service_role_key') or 
                           project_keys.get('anon_key') if project_keys else api_key)
         
-        # Extract schema via REST API
+        has_pg_credentials = bool(credentials and (credentials.get('connection_string') or credentials.get('db_password')))
+        # Backward-compatible default: fallback to REST when direct PG extraction fails.
+        # Set strict_pg_extraction=true to fail fast instead.
+        strict_pg_extraction = bool(credentials and credentials.get("strict_pg_extraction"))
+
+        # Prefer direct PostgreSQL extraction when credentials are available.
+        # It is the most reliable path for PK/FK metadata across Supabase projects.
+        if has_pg_credentials:
+            try:
+                logger.info("Using direct PostgreSQL extraction (preferred for full constraint metadata)...")
+                # Try to extract project_ref from connection string if available
+                connection_string = credentials.get('connection_string')
+                if connection_string and 'postgres.' in connection_string:
+                    # Extract project_ref from connection string: postgres.{project_ref}@...
+                    import re
+                    match = re.search(r'postgres\.([^:]+)@', connection_string)
+                    if match:
+                        project_ref_from_conn = match.group(1)
+                        logger.info(f"Extracted project_ref '{project_ref_from_conn}' from connection string")
+                        project_ref = project_ref_from_conn
+                schema = self._extract_schema_via_postgres(credentials, project_ref, table_names)
+                if schema.tables:
+                    return schema
+                if strict_pg_extraction:
+                    raise ValueError(
+                        "Direct Supabase PostgreSQL extraction returned no tables. "
+                        "To preserve constraints (FK/PK), provide valid Supabase DB credentials "
+                        "(connection_string or db_password with correct project_ref/region)."
+                    )
+                logger.warning("Direct PostgreSQL extraction returned no tables; falling back to REST extraction...")
+            except Exception as pg_extract_error:
+                if strict_pg_extraction:
+                    raise ValueError(
+                        f"Direct Supabase PostgreSQL extraction failed: {pg_extract_error}. "
+                        "To preserve constraints (FK/PK), provide valid Supabase DB credentials "
+                        "(connection_string or db_password with correct project_ref/region)."
+                    )
+                logger.warning(f"Direct PostgreSQL extraction failed, falling back to REST extraction: {pg_extract_error}")
+
+        # Fallback/default: extract schema via REST API
         schema = self._extract_schema_via_rest(project_api_key, project_url, project_ref, table_names)
         
-        # If REST API failed to discover tables and we have connection info, fallback to PostgreSQL
-        if not schema.tables and (credentials.get('connection_string') or credentials.get('db_password')):
-            logger.info("REST API failed to discover tables. Falling back to direct PostgreSQL connection...")
-            # Try to extract project_ref from connection string if available
-            connection_string = credentials.get('connection_string')
-            if connection_string and 'postgres.' in connection_string:
-                # Extract project_ref from connection string: postgres.{project_ref}@...
-                import re
-                match = re.search(r'postgres\.([^:]+)@', connection_string)
-                if match:
-                    project_ref_from_conn = match.group(1)
-                    logger.info(f"Extracted project_ref '{project_ref_from_conn}' from connection string")
-                    project_ref = project_ref_from_conn
+        # Last fallback: if REST returned no tables and we have PG credentials, try PostgreSQL extraction once more.
+        if not schema.tables and has_pg_credentials:
+            logger.info("REST API failed to discover tables. Retrying direct PostgreSQL extraction...")
             schema = self._extract_schema_via_postgres(credentials, project_ref, table_names)
         
         return schema
@@ -171,6 +255,9 @@ class SupabaseConnector(DatabaseConnector):
                 # Fallback to other methods if OpenAPI didn't work
                 if not columns:
                     columns = self._get_table_columns(base_url, headers, table_name)
+                else:
+                    # OpenAPI definitions do not include FK metadata; enrich from information_schema when possible.
+                    columns = self._enrich_columns_with_constraints(base_url, headers, table_name, columns)
                 
                 if columns:
                     table_infos.append(TableInfo(name=table_name, columns=columns, indexes=[]))
@@ -199,7 +286,7 @@ class SupabaseConnector(DatabaseConnector):
             if db_password:
                 from urllib.parse import quote_plus
                 encoded_password = quote_plus(db_password)
-                project_region = credentials.get('region', 'ap-southeast-1')
+                project_region = self._normalize_region(credentials.get('region', 'ap-southeast-1'))
                 # Try to extract actual project_ref from connection string if available
                 conn_str_check = credentials.get('connection_string')
                 if conn_str_check and 'postgres.' in conn_str_check:
@@ -1171,6 +1258,31 @@ class SupabaseConnector(DatabaseConnector):
         # Fallback: assume 'id' is primary key if it exists
         return []
 
+    def _enrich_columns_with_constraints(
+        self,
+        base_url: str,
+        headers: Dict[str, str],
+        table_name: str,
+        columns: List[ColumnInfo],
+    ) -> List[ColumnInfo]:
+        """Attach PK/FK metadata to existing columns when schema came from OpenAPI/sample inference."""
+        try:
+            pk_columns = set(self._get_primary_keys(base_url, headers, table_name))
+            fk_columns = self._get_foreign_keys(base_url, headers, table_name)
+            for col in columns:
+                if col.name in pk_columns:
+                    col.is_primary_key = True
+                fk_info = fk_columns.get(col.name)
+                if fk_info:
+                    col.is_foreign_key = True
+                    col.foreign_key_table = fk_info.get("foreign_table_name")
+                    col.foreign_key_column = fk_info.get("foreign_column_name")
+                    col.foreign_key_on_delete = fk_info.get("on_delete")
+                    col.foreign_key_on_update = fk_info.get("on_update")
+        except Exception as e:
+            logger.debug(f"  Could not enrich constraints for {table_name}: {e}")
+        return columns
+
     def _get_foreign_keys(self, base_url: str, headers: Dict[str, str], table_name: str) -> Dict[str, Dict[str, Any]]:
         """Get foreign key metadata keyed by local column name."""
         try:
@@ -1387,30 +1499,38 @@ class SupabaseConnector(DatabaseConnector):
         
         # Check if project has connection info in API response (if available)
         project_db_host = None
-        project_region = 'ap-southeast-1'  # Default region (most common)
+        project_region = self._normalize_region(
+            credentials.get('region') if credentials else 'ap-southeast-1'
+        )
         try:
             if 'project' in locals() and project:
                 project_db_host = project.get('db_host') or project.get('database_host')
                 # Get region from API response
                 api_region = project.get('region') or project.get('cloud_provider')
                 if api_region:
-                    # Map common region formats
-                    if 'ap-southeast' in api_region.lower() or 'singapore' in api_region.lower():
-                        project_region = 'ap-southeast-1'
-                    elif 'us-east' in api_region.lower():
-                        project_region = 'us-east-1'
-                    elif 'us-west' in api_region.lower():
-                        project_region = 'us-west-1'
-                    elif 'eu-west' in api_region.lower():
-                        project_region = 'eu-west-1'
-                    elif 'ap-northeast' in api_region.lower():
-                        project_region = 'ap-northeast-1'
-                    else:
-                        project_region = api_region  # Use as-is if format is different
+                    project_region = self._normalize_region(api_region)
                 if project_db_host:
                     logger.debug(f"Found database host from API: {project_db_host}")
         except:
             pass
+
+        # Support both payloads:
+        # 1) with region explicitly provided
+        # 2) without region (api_key + project_ref + db_password), resolve region from API.
+        if project_ref and credentials and not credentials.get('region'):
+            try:
+                projects = get_all_supabase_projects(api_key)
+                matched = next(
+                    (p for p in projects if (p.get('ref') or p.get('id')) == project_ref),
+                    None,
+                )
+                if matched:
+                    api_region = matched.get('region') or matched.get('cloud_provider')
+                    if api_region:
+                        project_region = self._normalize_region(api_region)
+                        logger.info(f"Resolved project region from API: {project_region}")
+            except Exception as region_error:
+                logger.debug(f"Could not resolve project region from API for apply_schema: {region_error}")
         
         # Check if full connection string is provided (bypasses all DNS/hostname issues)
         connection_string = credentials.get('connection_string') if credentials else None
